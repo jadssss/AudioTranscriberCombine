@@ -11,8 +11,8 @@ from core.pipeline import run_pipeline
 
 class PipelineWorker(QThread):
     log = Signal(str)
-    progress = Signal(int, int)     # done, total
-    finished_ok = Signal(list)      # list[FileResult]
+    progress = Signal(int, int, str)   # done, total, stage
+    finished_ok = Signal(list)
     failed = Signal(str)
 
     def __init__(self, config: PipelineConfig, parent=None):
@@ -23,12 +23,12 @@ class PipelineWorker(QThread):
     def stop(self) -> None:
         self._stop_event.set()
 
-    def run(self) -> None:  # noqa: D401 — Qt override
+    def run(self) -> None:
         try:
             results = run_pipeline(
                 self._config,
                 log=self.log.emit,
-                on_progress=lambda d, t: self.progress.emit(d, t),
+                on_progress=lambda d, t, s: self.progress.emit(d, t, s),
                 stop_event=self._stop_event,
             )
             self.finished_ok.emit(results)

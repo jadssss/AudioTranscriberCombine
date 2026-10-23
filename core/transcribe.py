@@ -1,10 +1,12 @@
 """Speech recognition via WhisperX or GigaAM (onnx-asr).
 
 Models are cached per (name, device, compute_type) so loading happens once
-per process, not once per file.
+per process, not once per file. Loading is retried a few times to survive
+transient HuggingFace / SSL hiccups.
 """
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -19,6 +21,18 @@ def _resolve_device(device: str) -> str:
         return "cpu"
 
 
+def _retry(fn, attempts: int = 3, base_delay: float = 2.0):
+    last = None
+    for i in range(attempts):
+        try:
+            return fn()
+        except Exception as e:  # noqa: BLE001 — HF download / SSL are broad
+            last = e
+            if i < attempts - 1:
+                time.sleep(base_delay * (i + 1))
+    raise last
+
+
 class _WhisperXModels:
     _cache: dict = {}
 
@@ -29,9 +43,11 @@ class _WhisperXModels:
         key = (model_name, device, compute_type)
         if key not in cls._cache:
             import whisperx
-            cls._cache[key] = whisperx.load_model(
-                model_name, device, compute_type=compute_type
-            )
+
+            def load():
+                return whisperx.load_model(model_name, device, compute_type=compute_type)
+
+            cls._cache[key] = _retry(load)
         return cls._cache[key]
 
 
@@ -40,8 +56,6 @@ class _GigaAMModels:
 
     @classmethod
     def get(cls, provider: str):
-        # onnx-asr accepts a list; CUDAExecutionProvider silently falls back to CPU
-        # if CUDA isn't available at runtime.
         providers = {
             "cuda": ["CUDAExecutionProvider"],
             "cpu": ["CPUExecutionProvider"],
@@ -50,7 +64,11 @@ class _GigaAMModels:
         key = tuple(providers)
         if key not in cls._cache:
             import onnx_asr
-            cls._cache[key] = onnx_asr.load_model("gigaam-v3-ctc", providers=list(providers))
+
+            def load():
+                return onnx_asr.load_model("gigaam-v3-ctc", providers=list(providers))
+
+            cls._cache[key] = _retry(load)
         return cls._cache[key]
 
 
@@ -65,11 +83,8 @@ def transcribe(
     gigaam_provider: str = "auto",
 ) -> str:
     device = _resolve_device(device)
-
     if engine == "whisperx":
-        return _transcribe_whisperx(
-            audio_path, model, language, device, compute_type, batch_size
-        )
+        return _transcribe_whisperx(audio_path, model, language, device, compute_type, batch_size)
     if engine == "gigaam":
         return _transcribe_gigaam(audio_path, gigaam_provider)
     raise ValueError(f"Unknown ASR engine: {engine!r}")

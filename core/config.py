@@ -7,6 +7,9 @@ from pathlib import Path
 from typing import Optional
 
 
+MODES = ("sequential", "staged")
+
+
 @dataclass
 class ConvertConfig:
     enabled: bool = True
@@ -31,7 +34,7 @@ class TranscribeConfig:
     model: str = "large-v3"
     language: Optional[str] = "ru"     # None = autodetect
     device: str = "auto"               # "cuda" | "cpu" | "auto"
-    compute_type: Optional[str] = None  # None = auto (int8_float16 / int8)
+    compute_type: Optional[str] = None  # None = auto
     batch_size: int = 8
     gigaam_provider: str = "auto"      # "auto" | "cuda" | "cpu"
 
@@ -43,12 +46,12 @@ class PipelineConfig:
     recursive: bool = False
     keep_intermediate: bool = True
     overwrite: bool = True
+    mode: str = "sequential"           # "sequential" | "staged"
 
     convert: ConvertConfig = field(default_factory=ConvertConfig)
     separate: SeparateConfig = field(default_factory=SeparateConfig)
     transcribe: TranscribeConfig = field(default_factory=TranscribeConfig)
 
-    # --- serialization ---
     def to_dict(self) -> dict:
         return asdict(self)
 
@@ -65,9 +68,9 @@ class PipelineConfig:
             value = data[name]
             current = getattr(cfg, name)
             if hasattr(current, "__dataclass_fields__"):
-                sub_fields = {f.name for f in fields(current)}
+                sub = {f.name for f in fields(current)}
                 for k, v in value.items():
-                    if k in sub_fields:
+                    if k in sub:
                         setattr(current, k, v)
             else:
                 setattr(cfg, name, value)

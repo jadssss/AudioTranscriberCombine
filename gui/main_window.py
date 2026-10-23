@@ -1,19 +1,17 @@
-"""Main application window."""
+"""Main application window — dark theme, mode selector, staged/sequential pipelines."""
 from __future__ import annotations
 
 import shutil
-import subprocess
-import sys
 from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import Qt, QUrl
-from PySide6.QtGui import QDesktopServices
+from PySide6.QtGui import QColor, QDesktopServices
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QFileDialog, QFormLayout, QGroupBox,
     QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox,
-    QPlainTextEdit, QProgressBar, QPushButton, QSpinBox, QSplitter,
-    QTabWidget, QVBoxLayout, QWidget,
+    QPlainTextEdit, QProgressBar, QPushButton, QSpinBox, QTabWidget,
+    QVBoxLayout, QWidget,
 )
 
 from core.config import ConvertConfig, PipelineConfig, SeparateConfig, TranscribeConfig
@@ -24,33 +22,74 @@ LANGUAGES = ["auto", "ru", "en", "de", "fr", "es", "it", "uk", "ja", "zh", "ko"]
 SAMPLE_RATES = [16000, 22050, 44100, 48000]
 ENGINES = ["whisperx", "gigaam"]
 
+STAGE_LABELS = {
+    "file": "Файлы",
+    "convert": "Конвертация",
+    "separate": "Отделение",
+    "transcribe": "Транскрибация",
+}
 
-def _detect_torch_cuda() -> bool:
+MODE_LABELS = {
+    "sequential": "Последовательно (файл за файлом)",
+    "staged": "Пакетно (по этапам)",
+}
+
+
+def _detect_device_info() -> tuple[str, str]:
+    """Return (display_text, color_hex) describing the compute device."""
     try:
         import torch
-        return bool(torch.cuda.is_available())
-    except Exception:
-        return False
+    except ImportError:
+        return "⚠ PyTorch не установлен", "#f38ba8"
+
+    if torch.cuda.is_available():
+        try:
+            name = torch.cuda.get_device_name(0)
+            vram = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+            return f"✓ CUDA: {name} · {vram:.1f} GB VRAM", "#a6e3a1"
+        except Exception:  # noqa: BLE001
+            return "✓ CUDA доступна", "#a6e3a1"
+
+    return "⚠ CUDA не обнаружена — расчёт пойдёт на CPU (медленно)", "#f9e2af"
 
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Song Transcriber v3")
-        self.resize(1080, 760)
+        self.setWindowTitle("Song Transcriber")
+        self.resize(1100, 850)
         self._worker: Optional[PipelineWorker] = None
         self._build_ui()
         self._apply_defaults()
+        self._sync_tab_indicators()
+        self._sync_engine_fields()
+        self._log_device_info()
 
     # ---------------- UI ----------------
+
     def _build_ui(self) -> None:
         central = QWidget()
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
+        root.setContentsMargins(18, 16, 18, 16)
+        root.setSpacing(12)
 
-        # --- top: paths + options ---
+        # --- header row: title + device badge ---
+        header = QHBoxLayout()
+        title = QLabel("🎵 Song Transcriber")
+        title.setObjectName("appTitle")
+        header.addWidget(title)
+        header.addStretch(1)
+
+        self.device_label = QLabel("")
+        self.device_label.setObjectName("deviceInfo")
+        header.addWidget(self.device_label)
+        root.addLayout(header)
+
+        # --- top settings ---
         top_box = QGroupBox("Общие настройки")
         top_layout = QFormLayout(top_box)
+        top_layout.setSpacing(10)
 
         self.input_edit = QLineEdit()
         top_layout.addRow("Входная папка:", self._with_browse(self.input_edit, self._pick_input_dir))
@@ -58,81 +97,97 @@ class MainWindow(QMainWindow):
         self.output_edit = QLineEdit()
         top_layout.addRow("Выходная папка:", self._with_browse(self.output_edit, self._pick_output_dir))
 
-        opts_row = QHBoxLayout()
+        self.mode_cb = QComboBox()
+        for key, label in MODE_LABELS.items():
+            self.mode_cb.addItem(label, key)
+        top_layout.addRow("Режим:", self.mode_cb)
+
+        opts = QHBoxLayout()
         self.recursive_cb = QCheckBox("Рекурсивный обход")
-        self.keep_intermediate_cb = QCheckBox("Сохранять промежуточные файлы")
+        self.keep_intermediate_cb = QCheckBox("Сохранять промежуточные")
         self.overwrite_cb = QCheckBox("Перезаписывать")
-        opts_row.addWidget(self.recursive_cb)
-        opts_row.addWidget(self.keep_intermediate_cb)
-        opts_row.addWidget(self.overwrite_cb)
-        opts_row.addStretch(1)
-        top_layout.addRow("Опции:", opts_row)
+        opts.addWidget(self.recursive_cb)
+        opts.addWidget(self.keep_intermediate_cb)
+        opts.addWidget(self.overwrite_cb)
+        opts.addStretch(1)
+        top_layout.addRow("Опции:", opts)
 
         root.addWidget(top_box)
 
-        # --- stages tabs ---
-        tabs = QTabWidget()
-        tabs.addTab(self._build_convert_tab(), "Конвертация")
-        tabs.addTab(self._build_separate_tab(), "Отделение вокала")
-        tabs.addTab(self._build_transcribe_tab(), "Транскрибация")
-        root.addWidget(tabs)
+        # --- stages ---
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self._build_convert_tab(), "Конвертация")
+        self.tabs.addTab(self._build_separate_tab(), "Отделение вокала")
+        self.tabs.addTab(self._build_transcribe_tab(), "Транскрибация")
+        root.addWidget(self.tabs)
 
-        # --- run row ---
-        run_row = QHBoxLayout()
-        self.start_btn = QPushButton("▶ Запустить")
+        self.convert_enabled_cb.toggled.connect(self._sync_tab_indicators)
+        self.separate_enabled_cb.toggled.connect(self._sync_tab_indicators)
+        self.transcribe_enabled_cb.toggled.connect(self._sync_tab_indicators)
+        self.engine_cb.currentTextChanged.connect(self._sync_engine_fields)
+
+        # --- controls row ---
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        self.start_btn = QPushButton("▶  Запустить")
+        self.start_btn.setObjectName("primary")
         self.start_btn.clicked.connect(self._on_start)
-        self.stop_btn = QPushButton("⏹ Стоп")
+        self.stop_btn = QPushButton("⏹  Стоп")
+        self.stop_btn.setObjectName("danger")
         self.stop_btn.setEnabled(False)
         self.stop_btn.clicked.connect(self._on_stop)
-        self.open_out_btn = QPushButton("📂 Открыть выходную папку")
+
+        self.open_out_btn = QPushButton("📂  Открыть результат")
         self.open_out_btn.clicked.connect(self._open_output_dir)
-        self.save_preset_btn = QPushButton("💾 Сохранить пресет")
+        self.save_preset_btn = QPushButton("💾  Сохранить пресет")
         self.save_preset_btn.clicked.connect(self._save_preset)
-        self.load_preset_btn = QPushButton("📁 Загрузить пресет")
+        self.load_preset_btn = QPushButton("📁  Загрузить пресет")
         self.load_preset_btn.clicked.connect(self._load_preset)
 
-        run_row.addWidget(self.start_btn)
-        run_row.addWidget(self.stop_btn)
-        run_row.addStretch(1)
-        run_row.addWidget(self.open_out_btn)
-        run_row.addWidget(self.save_preset_btn)
-        run_row.addWidget(self.load_preset_btn)
-        root.addLayout(run_row)
+        row.addWidget(self.start_btn)
+        row.addWidget(self.stop_btn)
+        row.addStretch(1)
+        row.addWidget(self.open_out_btn)
+        row.addWidget(self.save_preset_btn)
+        row.addWidget(self.load_preset_btn)
+        root.addLayout(row)
 
         # --- progress ---
         self.progress = QProgressBar()
-        self.progress.setFormat("%v / %m")
+        self.progress.setFormat("Ожидание")
         root.addWidget(self.progress)
 
         # --- log ---
-        splitter = QSplitter(Qt.Vertical)
         self.log_view = QPlainTextEdit()
+        self.log_view.setObjectName("log")
         self.log_view.setReadOnly(True)
-        self.log_view.setPlaceholderText("Здесь будет лог выполнения…")
-        splitter.addWidget(self.log_view)
-        splitter.setStretchFactor(0, 1)
-        root.addWidget(splitter, 1)
+        self.log_view.setPlaceholderText("Здесь появится лог выполнения…")
+        root.addWidget(self.log_view, 1)
 
-    def _with_browse(self, line_edit: QLineEdit, picker) -> QWidget:
-        wrapper = QWidget()
-        h = QHBoxLayout(wrapper)
+    def _with_browse(self, edit: QLineEdit, picker) -> QWidget:
+        w = QWidget()
+        h = QHBoxLayout(w)
         h.setContentsMargins(0, 0, 0, 0)
-        h.addWidget(line_edit)
+        h.setSpacing(6)
+        h.addWidget(edit)
         btn = QPushButton("…")
-        btn.setFixedWidth(32)
+        btn.setFixedWidth(36)
         btn.clicked.connect(picker)
         h.addWidget(btn)
-        return wrapper
+        return w
 
     def _build_convert_tab(self) -> QWidget:
         w = QWidget()
         form = QFormLayout(w)
+        form.setContentsMargins(16, 16, 16, 16)
+        form.setSpacing(10)
+
         self.convert_enabled_cb = QCheckBox("Включён")
         form.addRow("", self.convert_enabled_cb)
 
         self.convert_sr = QComboBox()
         for sr in SAMPLE_RATES:
-            self.convert_sr.addItem(str(sr), sr)
+            self.convert_sr.addItem(f"{sr} Hz", sr)
         form.addRow("Sample rate:", self.convert_sr)
 
         self.convert_ch = QComboBox()
@@ -147,6 +202,9 @@ class MainWindow(QMainWindow):
     def _build_separate_tab(self) -> QWidget:
         w = QWidget()
         form = QFormLayout(w)
+        form.setContentsMargins(16, 16, 16, 16)
+        form.setSpacing(10)
+
         self.separate_enabled_cb = QCheckBox("Включён")
         form.addRow("", self.separate_enabled_cb)
 
@@ -166,6 +224,9 @@ class MainWindow(QMainWindow):
     def _build_transcribe_tab(self) -> QWidget:
         w = QWidget()
         form = QFormLayout(w)
+        form.setContentsMargins(16, 16, 16, 16)
+        form.setSpacing(10)
+
         self.transcribe_enabled_cb = QCheckBox("Включён")
         form.addRow("", self.transcribe_enabled_cb)
 
@@ -179,6 +240,10 @@ class MainWindow(QMainWindow):
         self.lang_cb = QComboBox()
         self.lang_cb.setEditable(True)
         self.lang_cb.addItems(LANGUAGES)
+        self.lang_cb.setToolTip(
+            "'auto' — WhisperX определяет язык на каждом файле отдельно.\n"
+            "Это заметно медленнее. Если знаешь язык — выбери его явно."
+        )
         form.addRow("Язык:", self.lang_cb)
 
         self.device_cb = QComboBox()
@@ -190,7 +255,13 @@ class MainWindow(QMainWindow):
         form.addRow("Compute type:", self.compute_type_cb)
 
         self.batch_spin = QSpinBox()
-        self.batch_spin.setRange(1, 64)
+        self.batch_spin.setRange(1, 512)
+        self.batch_spin.setToolTip(
+            "Размер батча сегментов ВНУТРИ одного файла (не файлов!).\n"
+            "Больше ≠ всегда быстрее: упирается в VRAM.\n"
+            "8–16 для 8 ГБ VRAM, 32–64 для 24 ГБ.\n"
+            "При 'CUDA out of memory' — уменьшайте."
+        )
         form.addRow("Batch size:", self.batch_spin)
 
         self.gigaam_provider_cb = QComboBox()
@@ -198,21 +269,51 @@ class MainWindow(QMainWindow):
         form.addRow("GigaAM provider:", self.gigaam_provider_cb)
         return w
 
-    # ---------------- defaults ----------------
+    # ---------------- visual sync ----------------
+
+    def _log_device_info(self) -> None:
+        text, color = _detect_device_info()
+        self.device_label.setText(text)
+        self.device_label.setStyleSheet(f"color: {color};")
+        self._append_log(text)
+
+    def _sync_tab_indicators(self) -> None:
+        active = QColor("#89b4fa")
+        inactive = QColor("#585b70")
+        bar = self.tabs.tabBar()
+        bar.setTabTextColor(0, active if self.convert_enabled_cb.isChecked() else inactive)
+        bar.setTabTextColor(1, active if self.separate_enabled_cb.isChecked() else inactive)
+        bar.setTabTextColor(2, active if self.transcribe_enabled_cb.isChecked() else inactive)
+
+    def _sync_engine_fields(self) -> None:
+        is_whisperx = self.engine_cb.currentText() == "whisperx"
+        for w in (self.lang_cb, self.device_cb, self.compute_type_cb, self.batch_spin):
+            w.setEnabled(is_whisperx)
+        self.gigaam_provider_cb.setEnabled(not is_whisperx)
+
+    # ---------------- defaults & config <-> UI ----------------
+
     def _apply_defaults(self) -> None:
-        cfg = PipelineConfig()
+        self._apply_config(PipelineConfig())
+
+    def _apply_config(self, cfg: PipelineConfig) -> None:
+        self.input_edit.setText(cfg.input_dir)
         self.output_edit.setText(str(Path(cfg.output_dir).absolute()))
         self.recursive_cb.setChecked(cfg.recursive)
         self.keep_intermediate_cb.setChecked(cfg.keep_intermediate)
         self.overwrite_cb.setChecked(cfg.overwrite)
 
+        i = self.mode_cb.findData(cfg.mode)
+        if i >= 0:
+            self.mode_cb.setCurrentIndex(i)
+
         self.convert_enabled_cb.setChecked(cfg.convert.enabled)
-        idx = self.convert_sr.findData(cfg.convert.sample_rate)
-        if idx >= 0:
-            self.convert_sr.setCurrentIndex(idx)
-        idx = self.convert_ch.findData(cfg.convert.channels)
-        if idx >= 0:
-            self.convert_ch.setCurrentIndex(idx)
+        i = self.convert_sr.findData(cfg.convert.sample_rate)
+        if i >= 0:
+            self.convert_sr.setCurrentIndex(i)
+        i = self.convert_ch.findData(cfg.convert.channels)
+        if i >= 0:
+            self.convert_ch.setCurrentIndex(i)
         self.convert_ffmpeg.setText(cfg.convert.ffmpeg_path)
 
         self.separate_enabled_cb.setChecked(cfg.separate.enabled)
@@ -230,7 +331,6 @@ class MainWindow(QMainWindow):
         self.batch_spin.setValue(cfg.transcribe.batch_size)
         self.gigaam_provider_cb.setCurrentText(cfg.transcribe.gigaam_provider)
 
-    # ---------------- config <-> ui ----------------
     def _collect_config(self) -> PipelineConfig:
         cfg = PipelineConfig()
         cfg.input_dir = self.input_edit.text().strip()
@@ -238,6 +338,7 @@ class MainWindow(QMainWindow):
         cfg.recursive = self.recursive_cb.isChecked()
         cfg.keep_intermediate = self.keep_intermediate_cb.isChecked()
         cfg.overwrite = self.overwrite_cb.isChecked()
+        cfg.mode = self.mode_cb.currentData()
 
         cfg.convert = ConvertConfig(
             enabled=self.convert_enabled_cb.isChecked(),
@@ -267,38 +368,8 @@ class MainWindow(QMainWindow):
         )
         return cfg
 
-    def _apply_config(self, cfg: PipelineConfig) -> None:
-        self.input_edit.setText(cfg.input_dir)
-        self.output_edit.setText(cfg.output_dir)
-        self.recursive_cb.setChecked(cfg.recursive)
-        self.keep_intermediate_cb.setChecked(cfg.keep_intermediate)
-        self.overwrite_cb.setChecked(cfg.overwrite)
-
-        self.convert_enabled_cb.setChecked(cfg.convert.enabled)
-        i = self.convert_sr.findData(cfg.convert.sample_rate)
-        if i >= 0:
-            self.convert_sr.setCurrentIndex(i)
-        i = self.convert_ch.findData(cfg.convert.channels)
-        if i >= 0:
-            self.convert_ch.setCurrentIndex(i)
-        self.convert_ffmpeg.setText(cfg.convert.ffmpeg_path)
-
-        self.separate_enabled_cb.setChecked(cfg.separate.enabled)
-        self.separate_model.setText(cfg.separate.model)
-        self.separate_stem.setText(cfg.separate.isolate_stem)
-        self.separate_unblend.setText(cfg.separate.unblend_path)
-        self.separate_kernels_cb.setChecked(cfg.separate.custom_kernels)
-
-        self.transcribe_enabled_cb.setChecked(cfg.transcribe.enabled)
-        self.engine_cb.setCurrentText(cfg.transcribe.engine)
-        self.model_edit.setText(cfg.transcribe.model)
-        self.lang_cb.setCurrentText(cfg.transcribe.language or "auto")
-        self.device_cb.setCurrentText(cfg.transcribe.device)
-        self.compute_type_cb.setCurrentText(cfg.transcribe.compute_type or "auto")
-        self.batch_spin.setValue(cfg.transcribe.batch_size)
-        self.gigaam_provider_cb.setCurrentText(cfg.transcribe.gigaam_provider)
-
     # ---------------- handlers ----------------
+
     def _pick_input_dir(self) -> None:
         d = QFileDialog.getExistingDirectory(self, "Выберите входную папку")
         if d:
@@ -315,9 +386,7 @@ class MainWindow(QMainWindow):
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(p)))
 
     def _save_preset(self) -> None:
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Сохранить пресет", "preset.json", "JSON (*.json)"
-        )
+        path, _ = QFileDialog.getSaveFileName(self, "Сохранить пресет", "preset.json", "JSON (*.json)")
         if not path:
             return
         try:
@@ -326,9 +395,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Ошибка", str(exc))
 
     def _load_preset(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Загрузить пресет", "", "JSON (*.json)"
-        )
+        path, _ = QFileDialog.getOpenFileName(self, "Загрузить пресет", "", "JSON (*.json)")
         if not path:
             return
         try:
@@ -344,23 +411,23 @@ class MainWindow(QMainWindow):
         if not (cfg.convert.enabled or cfg.separate.enabled or cfg.transcribe.enabled):
             QMessageBox.warning(self, "Нет этапов", "Включите хотя бы один этап.")
             return
-
-        # sanity: ffmpeg / unblend availability
         if cfg.convert.enabled and not shutil.which(cfg.convert.ffmpeg_path):
-            QMessageBox.warning(
-                self, "ffmpeg не найден",
-                f"Команда '{cfg.convert.ffmpeg_path}' не найдена в PATH.",
-            )
+            QMessageBox.warning(self, "ffmpeg не найден",
+                                f"Команда '{cfg.convert.ffmpeg_path}' не найдена в PATH.")
             return
         if cfg.separate.enabled and not shutil.which(cfg.separate.unblend_path):
-            QMessageBox.warning(
-                self, "unblend не найден",
-                f"Команда '{cfg.separate.unblend_path}' не найдена в PATH.",
-            )
+            QMessageBox.warning(self, "unblend не найден",
+                                f"Команда '{cfg.separate.unblend_path}' не найдена в PATH.")
             return
 
         self.log_view.clear()
+        self._log_device_info()
+        if cfg.transcribe.enabled and cfg.transcribe.language is None:
+            self._append_log("⚠ Язык = auto: WhisperX определит язык на каждом файле. "
+                             "Если язык известен — задайте его явно, будет быстрее.")
+
         self.progress.setValue(0)
+        self.progress.setFormat("Запуск…")
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
 
@@ -381,19 +448,23 @@ class MainWindow(QMainWindow):
         sb = self.log_view.verticalScrollBar()
         sb.setValue(sb.maximum())
 
-    def _on_progress(self, done: int, total: int) -> None:
+    def _on_progress(self, done: int, total: int, stage: str) -> None:
         self.progress.setMaximum(total)
         self.progress.setValue(done)
+        label = STAGE_LABELS.get(stage, stage)
+        self.progress.setFormat(f"{label} — %v / %m")
 
     def _on_finished(self, results: list) -> None:
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         ok = sum(1 for r in results if r.error is None)
         fail = len(results) - ok
+        self.progress.setFormat(f"Готово — успешно {ok}, с ошибкой {fail}")
         self._append_log(f"\n✅ Готово. Успешно: {ok}, с ошибкой: {fail}.")
 
     def _on_failed(self, message: str) -> None:
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
+        self.progress.setFormat("Ошибка")
         self._append_log(f"\n✗ Ошибка пайплайна: {message}")
         QMessageBox.critical(self, "Ошибка", message)
