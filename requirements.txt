@@ -1,0 +1,15 @@
+# GUI
+PySide6>=6.6
+
+# ASR
+whisperx>=3.1
+onnx-asr>=0.4
+
+# WhisperX pulls torch; for CUDA you must install the matching torch build, e.g.:
+#   pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121
+# For cuDNN preload helper used in main.py:
+#   pip install nvidia-cudnn-cu12
+
+# System dependencies (not pip-installable):
+#   ffmpeg          — must be in PATH
+#   unblend         — vocal separation CLI (Mel-Band RoFormer), must be in PATH

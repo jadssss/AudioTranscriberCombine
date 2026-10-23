@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+transcribed/
+output/
+*.wav
+*.flac
+*.mp3
+!tests/fixtures/*
+
+preset.json
+*.log
