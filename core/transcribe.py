@@ -1,11 +1,11 @@
 """Speech recognition via WhisperX or GigaAM (onnx-asr).
 
-Models are cached per (name, device, compute_type) so loading happens once
-per process, not once per file. Loading is retried a few times to survive
-transient HuggingFace / SSL hiccups.
+Includes aggressive VRAM cleanup to prevent OOM on long batches,
+and automatic model reload if the CUDA context gets corrupted.
 """
 from __future__ import annotations
 
+import gc
 import time
 from pathlib import Path
 from typing import Optional
@@ -26,7 +26,7 @@ def _retry(fn, attempts: int = 3, base_delay: float = 2.0):
     for i in range(attempts):
         try:
             return fn()
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             last = e
             if i < attempts - 1:
                 time.sleep(base_delay * (i + 1))
@@ -93,11 +93,31 @@ def transcribe(
     vad_filter: bool = True,
 ) -> str:
     device = _resolve_device(device)
+
     if engine == "whisperx":
-        return _transcribe_whisperx(
-            audio_path, model, language, device, compute_type,
-            batch_size, local_files_only, vad_filter,
-        )
+        try:
+            return _transcribe_whisperx(
+                audio_path, model, language, device, compute_type,
+                batch_size, local_files_only, vad_filter,
+            )
+        except Exception as e:
+            err = str(e).lower()
+            if "out of memory" in err or "cuda" in err or "device ordinal" in err:
+                print(f"  [ASR] CUDA error: {e}. Clearing model cache and retrying...")
+                _WhisperXModels._cache.clear()
+                gc.collect()
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except ImportError:
+                    pass
+                return _transcribe_whisperx(
+                    audio_path, model, language, device, compute_type,
+                    batch_size, local_files_only, vad_filter,
+                )
+            raise
+
     if engine == "gigaam":
         return _transcribe_gigaam(audio_path, gigaam_provider)
     raise ValueError(f"Unknown ASR engine: {engine!r}")
@@ -121,7 +141,21 @@ def _transcribe_whisperx(
         batch_size=batch_size,
         language=language,
     )
-    return " ".join(seg["text"].strip() for seg in result["segments"]).strip()
+    
+    text = " ".join(seg["text"].strip() for seg in result["segments"]).strip()
+    
+    # Free VRAM aggressively to prevent fragmentation/OOM on long batches
+    del audio
+    del result
+    gc.collect()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except ImportError:
+        pass
+        
+    return text
 
 
 def _transcribe_gigaam(audio_path: Path, provider: str) -> str:

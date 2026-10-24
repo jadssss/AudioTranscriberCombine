@@ -1,0 +1,2456 @@
+# =========================================
+# Файл: .gitignore
+# =========================================
+
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+transcribed/
+output/
+*.wav
+*.flac
+*.mp3
+!tests/fixtures/*
+
+preset.json
+*.log
+
+
+# =========================================
+# Файл: main.py
+# =========================================
+
+#!/usr/bin/env python3
+"""Song Transcriber — Qt GUI entry point."""
+from __future__ import annotations
+
+import ctypes
+import os
+import sys
+
+# Must be set BEFORE PySide6 is imported.
+os.environ.setdefault("QT_LOGGING_RULES", "qt.qpa.wayland.textinput=false")
+
+
+def preload_cudnn() -> None:
+    try:
+        import nvidia.cudnn
+    except ImportError:
+        return
+    lib_dir = os.path.join(nvidia.cudnn.__path__[0], "lib")
+    if not os.path.isdir(lib_dir):
+        return
+    for fname in sorted(os.listdir(lib_dir)):
+        if ".so" in fname:
+            try:
+                ctypes.CDLL(os.path.join(lib_dir, fname), mode=ctypes.RTLD_GLOBAL)
+            except OSError:
+                pass
+
+
+def enable_tf32() -> None:
+    """Enable TF32 for faster matmul on Ampere+ GPUs (RTX 30/40 series)."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+    except ImportError:
+        pass
+
+
+def main() -> int:
+    preload_cudnn()
+    enable_tf32()
+
+    from PySide6.QtWidgets import QApplication
+    from gui.theme import DARK_STYLESHEET
+    from gui.main_window import MainWindow
+
+    app = QApplication(sys.argv)
+    app.setApplicationName("Audio Transcriber")
+    app.setStyle("Fusion")
+    app.setStyleSheet(DARK_STYLESHEET)
+
+    window = MainWindow()
+    window.show()
+    return app.exec()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+
+# =========================================
+# Файл: LICENSE
+# =========================================
+
+MIT License
+
+Copyright (c) 2026 jads
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and 
+associated documentation files (the "Software"), to deal in the Software without restriction, including 
+without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell 
+copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the 
+following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial 
+portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT 
+LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO 
+EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER 
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE 
+USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+
+# =========================================
+# Файл: core/separate.py
+# =========================================
+
+"""Vocal separation via unblend (Mel-Band RoFormer).
+
+Two entry points:
+
+- separate_vocals()       single file, subprocess per call (sequential mode)
+- separate_vocals_batch() many files in ONE subprocess, model loaded once
+                          (staged mode — big speedup on batches)
+"""
+from __future__ import annotations
+
+import os
+import subprocess
+from pathlib import Path
+
+
+def _build_env(custom_kernels: bool) -> dict:
+    env = os.environ.copy()
+    env["UNBLEND_CUSTOM_KERNELS"] = "1" if custom_kernels else "0"
+    return env
+
+
+def _check_result(result: subprocess.CompletedProcess, what: str) -> None:
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"unblend failed ({what}):\n{result.stderr.strip()[:1200]}"
+        )
+
+
+def separate_vocals(
+    input_wav: Path,
+    work_dir: Path,
+    model: str = "bs_roformer_anvuew",
+    isolate_stem: str = "vocals",
+    unblend_path: str = "unblend",
+    custom_kernels: bool = False,
+    device: str = "cuda",
+) -> Path:
+    """Separate one file. Returns path to the isolated stem WAV."""
+    work_dir.mkdir(parents=True, exist_ok=True)
+    output_pattern = work_dir / "{track}" / "{stem}.wav"
+    cmd = [
+        unblend_path, "separate", str(input_wav),
+        "-m", model,
+        "-o", str(output_pattern),
+        "--isolate-stem", isolate_stem,
+        "--device", device,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, env=_build_env(custom_kernels))
+    _check_result(result, input_wav.name)
+
+    candidates = sorted(work_dir.rglob(f"{isolate_stem}.wav"))
+    if not candidates:
+        raise RuntimeError(
+            f"unblend finished but stem '{isolate_stem}.wav' was not found in {work_dir}"
+        )
+    return candidates[0]
+
+
+def separate_vocals_batch(
+    input_wavs: list[Path],
+    work_root: Path,
+    model: str = "bs_roformer_anvuew",
+    isolate_stem: str = "vocals",
+    unblend_path: str = "unblend",
+    custom_kernels: bool = False,
+    device: str = "cuda",
+) -> dict[Path, Path]:
+    """Separate many files in one unblend invocation.
+
+    Input WAVs are expected to live in distinct directories
+    (e.g. <work_root>/<stem>/convert.wav). The output pattern uses {parent}
+    so each result lands next to its input as <parent>/vocals.wav.
+
+    Returns: {input_path: vocal_path}
+    """
+    if not input_wavs:
+        return {}
+
+    work_root.mkdir(parents=True, exist_ok=True)
+    output_pattern = work_root / "{parent}" / "{stem}.wav"
+
+    cmd = [
+        unblend_path, "separate",
+        *[str(p) for p in input_wavs],
+        "-m", model,
+        "-o", str(output_pattern),
+        "--isolate-stem", isolate_stem,
+        "--device", device,
+    ]
+
+    result = subprocess.run(cmd, capture_output=True, text=True, env=_build_env(custom_kernels))
+    _check_result(result, f"{len(input_wavs)} files")
+
+    mapping: dict[Path, Path] = {}
+    missing: list[Path] = []
+    for src in input_wavs:
+        candidate = src.parent / f"{isolate_stem}.wav"
+        if candidate.exists():
+            mapping[src] = candidate
+        else:
+            missing.append(src)
+
+    if missing:
+        # Fallback: search anywhere under work_root
+        found = sorted(work_root.rglob(f"{isolate_stem}.wav"))
+        if len(found) == len(input_wavs):
+            for src, dst in zip(input_wavs, found):
+                mapping[src] = dst
+        else:
+            names = ", ".join(p.name for p in missing[:3])
+            raise RuntimeError(
+                f"unblend finished but outputs missing for {len(missing)} file(s): {names}"
+            )
+
+    return mapping
+
+
+# =========================================
+# Файл: core/init.py
+# =========================================
+
+"""Core pipeline: convert, separate, transcribe."""
+
+
+# =========================================
+# Файл: core/convert.py
+# =========================================
+
+"""Convert any audio file to a WAV with chosen sample rate and channels via ffmpeg."""
+from __future__ import annotations
+
+import subprocess
+from pathlib import Path
+
+
+def convert_to_wav(
+    input_path: Path,
+    output_wav: Path,
+    sample_rate: int = 44100,
+    channels: int = 2,
+    ffmpeg_path: str = "ffmpeg",
+) -> None:
+    """Run ffmpeg to produce a WAV file. Raises RuntimeError on ffmpeg failure."""
+    output_wav.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        ffmpeg_path, "-y", "-hide_banner", "-loglevel", "error",
+        "-i", str(input_path),
+        "-ar", str(sample_rate),
+        "-ac", str(channels),
+        str(output_wav),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"ffmpeg failed for {input_path.name}:\n{result.stderr.strip()[:800]}"
+        )
+
+
+# =========================================
+# Файл: core/metadata.py
+# =========================================
+
+"""Read audio file tags via mutagen. Always safe — never raises."""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
+
+
+@dataclass
+class TrackMetadata:
+    title: Optional[str] = None
+    artist: Optional[str] = None
+    album: Optional[str] = None
+    duration: Optional[float] = None
+    has_identity: bool = False
+
+
+def read_metadata(path: Path) -> TrackMetadata:
+    """Extract title/artist/album/duration from tags. Never raises."""
+    try:
+        from mutagen import File
+    except ImportError:
+        return TrackMetadata()
+
+    try:
+        audio = File(str(path), easy=True)
+    except Exception:
+        return TrackMetadata()
+
+    if audio is None:
+        return TrackMetadata()
+
+    def _first(key: str) -> Optional[str]:
+        v = audio.get(key)
+        if isinstance(v, list):
+            return v[0] if v else None
+        if isinstance(v, str):
+            return v
+        return None
+
+    title = _first("title")
+    artist = _first("artist")
+    album = _first("album")
+
+    duration: Optional[float] = None
+    try:
+        if audio.info is not None:
+            duration = float(audio.info.length)
+    except Exception:
+        pass
+
+    return TrackMetadata(
+        title=title,
+        artist=artist,
+        album=album,
+        duration=duration,
+        has_identity=bool(title and artist),
+    )
+
+
+# =========================================
+# Файл: core/pipeline.py
+# =========================================
+
+"""Orchestrate identify -> convert -> separate -> transcribe -> lyrics-match.
+
+Pipeline order per track (short-circuits as soon as text is found):
+  1. metadata tags -> LRCLIB search (if `use_tags_first`)
+  2. Shazam fingerprint (if enabled)
+  3. Shazam result -> LRCLIB search (if `use_shazam_result`)
+  4. full pipeline: convert -> separate -> transcribe
+  5. post-ASR: LRCLIB search by recognized text (fuzzy match)
+
+Two modes:
+  - sequential: run all of the above per file
+  - staged:     identification pass first, then convert/separate/transcribe
+                passes only for unresolved files, then post-ASR lyrics pass.
+"""
+from __future__ import annotations
+
+import difflib
+import json
+import shutil
+import tempfile
+import threading
+import re
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable, Optional
+
+from .config import PipelineConfig
+from .convert import convert_to_wav
+from .lyrics import LyricsMatch, search_by_identity, search_by_text
+from .metadata import TrackMetadata, read_metadata
+from .recognize import ShazamResult, recognize
+from .separate import separate_vocals, separate_vocals_batch
+from .transcribe import transcribe
+
+
+AUDIO_EXTENSIONS = {
+    ".mp3", ".wav", ".flac", ".ogg", ".m4a", ".aac", ".opus", ".wma",
+}
+
+LogFn = Callable[[str], None]
+ProgressFn = Callable[[int, int, str], None]
+
+
+@dataclass
+class FileResult:
+    input_path: Path
+    text: Optional[str]
+    output_dir: Optional[Path]
+    error: Optional[str] = None
+    source: Optional[str] = None
+    metadata: Optional[dict] = field(default=None)
+
+
+class Cancelled(Exception):
+    """Raised when the stop event is set."""
+
+
+# ---------------------------------------------------------------- helpers
+
+def collect_audio_files(input_dir: Path, recursive: bool) -> list[Path]:
+    it = input_dir.rglob("*") if recursive else input_dir.iterdir()
+    return sorted(p for p in it if p.is_file() and p.suffix.lower() in AUDIO_EXTENSIONS)
+
+
+def _common_parent(paths: list[Path]) -> Path:
+    """Return the deepest common parent directory of the given paths."""
+    if not paths:
+        raise ValueError("empty paths")
+    parts = [p.resolve().parts for p in paths]
+    common = []
+    for chunk in zip(*parts):
+        if all(c == chunk[0] for c in chunk):
+            common.append(chunk[0])
+        else:
+            break
+    if not common:
+        return paths[0].parent
+    return Path(*common)
+
+
+def _check_cancel(stop_event: Optional[threading.Event]) -> None:
+    if stop_event is not None and stop_event.is_set():
+        raise Cancelled()
+
+
+def _text_head(text: str, n_words: int = 8) -> str:
+    return " ".join(text.split()[:n_words])
+
+
+def _build_metadata_dict(
+    metadata: TrackMetadata,
+    shazam: Optional[ShazamResult],
+    source: Optional[str],
+) -> Optional[dict]:
+    d: dict = {}
+    if metadata.has_identity:
+        d["tags"] = {
+            "title": metadata.title,
+            "artist": metadata.artist,
+            "album": metadata.album,
+            "duration": metadata.duration,
+        }
+    if shazam:
+        d["shazam"] = {
+            "title": shazam.title,
+            "artist": shazam.artist,
+            "album": shazam.album,
+            "year": shazam.year,
+        }
+    if source:
+        d["source"] = source
+    return d if d else None
+
+
+def _write_metadata_json(path: Path, data: Optional[dict]) -> None:
+    if not data:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(data, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+@dataclass
+class IdentifyResult:
+    metadata: TrackMetadata
+    shazam: Optional[ShazamResult] = None
+    text: Optional[str] = None
+    source: Optional[str] = None
+    needs_asr: bool = True
+
+
+def _identify_file(
+    input_path: Path,
+    work_dir: Path,
+    config: PipelineConfig,
+    log: LogFn,
+) -> IdentifyResult:
+    """Run cheap identification steps. May populate .text and .source,
+    and set .needs_asr=False if the track is fully resolved."""
+    result = IdentifyResult(metadata=read_metadata(input_path))
+
+    # --- tags -> LRCLIB ---
+    if (
+        config.lyrics.enabled
+        and config.lyrics.use_tags_first
+        and result.metadata.has_identity
+    ):
+        log("    LRCLIB по тегам...")
+        match = search_by_identity(
+            title=result.metadata.title,
+            artist=result.metadata.artist,
+            album=result.metadata.album,
+            duration=result.metadata.duration,
+            user_agent=config.lyrics.user_agent,
+            timeout=config.lyrics.timeout,
+        )
+        if match:
+            result.text = match.lyrics
+            result.source = "tag+lrclib"
+            result.needs_asr = False
+            log(f"    ✓ {match.artist} — {match.title}")
+            return result
+
+    # --- Shazam ---
+    if config.shazam.enabled:
+        log("    Shazam...")
+        shazam_wav = work_dir / "shazam_16k.wav"
+        try:
+            convert_to_wav(
+                input_path, shazam_wav,
+                sample_rate=16000, channels=1,
+                ffmpeg_path=config.convert.ffmpeg_path,
+            )
+            result.shazam = recognize(shazam_wav)
+        except Exception as e:  # noqa: BLE001
+            log(f"    ⚠ Shazam error: {e}")
+            result.shazam = None
+
+        if result.shazam:
+            log(f"    ✓ {result.shazam.artist} — {result.shazam.title}")
+
+            if config.lyrics.enabled and config.lyrics.use_shazam_result:
+                match = search_by_identity(
+                    title=result.shazam.title,
+                    artist=result.shazam.artist,
+                    album=result.shazam.album,
+                    duration=result.metadata.duration,
+                    user_agent=config.lyrics.user_agent,
+                    timeout=config.lyrics.timeout,
+                )
+                if match:
+                    result.text = match.lyrics
+                    result.source = "shazam+lrclib"
+                    result.needs_asr = False
+                    log("    ✓ текст найден через LRCLIB")
+                    return result
+
+            # Identified, but no lyrics
+            result.source = "shazam"
+            if not config.lyrics.transcribe_if_identified_no_lyrics:
+                result.needs_asr = False
+            log("    ⚠ текста нет")
+        else:
+            log("    ⚠ не распознан")
+
+    return result
+
+
+def _try_post_asr_match(
+    text: str,
+    config: PipelineConfig,
+    log: LogFn,
+) -> Optional[str]:
+    if not text:
+        return None
+
+    # Filter out common ASR watermarks/credits
+    ignore_phrases = ["субтитры", "редактор", "перевод", "сделал", "озвучка"]
+    lines = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if any(p in line.lower() for p in ignore_phrases):
+            continue
+        lines.append(line)
+
+    if not lines:
+        return None
+
+    # Take the first line with at least 3 words, strip punctuation
+    query = ""
+    for line in lines:
+        words = line.split()
+        if len(words) >= 3:
+            clean_words = [re.sub(r'[^\w\s]', '', w) for w in words]
+            query = " ".join(clean_words[:6])
+            break
+
+    if not query:
+        return None
+
+    log(f"    LRCLIB по тексту: {query!r}...")
+
+    try:
+        candidates = search_by_text(
+            query, limit=5,
+            user_agent=config.lyrics.user_agent,
+            timeout=config.lyrics.timeout,
+        )
+    except Exception as e:  # noqa: BLE001
+        log(f"    ⚠ LRCLIB error: {e}")
+        return None
+
+    if not candidates:
+        log("    ⚠ нет кандидатов")
+        return None
+
+    best: Optional[LyricsMatch] = None
+    best_ratio = 0.0
+    for c in candidates:
+        ratio = difflib.SequenceMatcher(None, text.lower(), c.lyrics.lower()).ratio()
+        if ratio > best_ratio:
+            best_ratio = ratio
+            best = c
+
+    if best is not None and best_ratio >= config.lyrics.fuzzy_threshold:
+        log(f"    ✓ совпадение {best_ratio:.2f}: {best.artist} — {best.title}")
+        return best.lyrics
+
+    log(f"    ⚠ лучшее совпадение {best_ratio:.2f} < {config.lyrics.fuzzy_threshold}")
+    return None
+
+
+def _persist_artifacts(
+    work_dir: Path,
+    persist_dir: Path,
+    config: PipelineConfig,
+    has_text: bool,
+    has_metadata: bool,
+    log: LogFn,
+) -> None:
+    """Move wanted artifacts from work_dir to persist_dir."""
+    persist_dir.mkdir(parents=True, exist_ok=True)
+
+    names: list[str] = []
+    if has_metadata and (work_dir / "metadata.json").exists():
+        names.append("metadata.json")
+    if has_text and (work_dir / "text.txt").exists():
+        names.append("text.txt")
+
+    if config.keep_intermediate:
+        for n in ("convert.wav", "vocals.wav"):
+            if (work_dir / n).exists():
+                names.append(n)
+    elif not has_text:
+        if config.separate.enabled and (work_dir / "vocals.wav").exists():
+            names.append("vocals.wav")
+        elif config.convert.enabled and (work_dir / "convert.wav").exists():
+            names.append("convert.wav")
+
+    for name in names:
+        src = work_dir / name
+        dst = persist_dir / name
+        if dst.exists():
+            dst.unlink()
+        shutil.move(str(src), str(dst))
+        log(f"    [persist] {name}")
+
+
+# ---------------------------------------------------------------- entry
+
+def run_pipeline(
+    config: PipelineConfig,
+    log: LogFn = print,
+    on_progress: Optional[ProgressFn] = None,
+    stop_event: Optional[threading.Event] = None,
+) -> list[FileResult]:
+    input_dir = Path(config.input_dir)
+    if not input_dir.is_dir():
+        raise FileNotFoundError(f"Input directory not found: {input_dir}")
+
+    output_dir = Path(config.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    files = collect_audio_files(input_dir, config.recursive)
+    if not files:
+        log("Аудиофайлы не найдены.")
+        return []
+
+    mode = (config.mode or "sequential").lower()
+    log(
+        f"Найдено треков: {len(files)}   |   режим: {mode}   |   "
+        f"keep_intermediate={config.keep_intermediate}"
+    )
+    if config.shazam.enabled:
+        log("  Shazam: включён")
+    if config.lyrics.enabled:
+        log(f"  LRCLIB: включён (порог fuzzy={config.lyrics.fuzzy_threshold:.2f})")
+
+    if mode == "staged":
+        return _run_staged(config, files, log, on_progress, stop_event)
+    return _run_sequential(config, files, log, on_progress, stop_event)
+
+
+# ---------------------------------------------------------------- sequential
+
+def _run_sequential(
+    config: PipelineConfig,
+    files: list[Path],
+    log: LogFn,
+    on_progress: Optional[ProgressFn],
+    stop_event: Optional[threading.Event],
+) -> list[FileResult]:
+    total = len(files)
+    results: list[FileResult] = []
+    output_root = Path(config.output_dir)
+
+    for idx, f in enumerate(files, 1):
+        if stop_event is not None and stop_event.is_set():
+            log("⏹ Отменено")
+            break
+        if on_progress:
+            on_progress(idx - 1, total, "file")
+        log(f"\n▶ [{idx}/{total}] {f.name}")
+
+        tmp_root = Path(tempfile.mkdtemp(prefix=f"at_{f.stem}_"))
+        track_out = output_root / f.stem
+        track_out.mkdir(parents=True, exist_ok=True)
+
+        text: Optional[str] = None
+        source: Optional[str] = None
+        error: Optional[str] = None
+        metadata_dict: Optional[dict] = None
+
+        try:
+            # --- Phase 1: identification ---
+            ident = _identify_file(f, tmp_root, config, log)
+
+            if not ident.needs_asr:
+                text = ident.text
+                source = ident.source
+                metadata_dict = _build_metadata_dict(ident.metadata, ident.shazam, source)
+                if text:
+                    (tmp_root / "text.txt").write_text(text, encoding="utf-8")
+                    log(f"  ✓ text.txt ({len(text)} символов, {source})")
+                if metadata_dict:
+                    _write_metadata_json(tmp_root / "metadata.json", metadata_dict)
+                    log("  ✓ metadata.json")
+                _persist_artifacts(
+                    tmp_root, track_out, config,
+                    has_text=text is not None,
+                    has_metadata=bool(metadata_dict),
+                    log=log,
+                )
+                results.append(FileResult(f, text, track_out, None, source, metadata_dict))
+                continue
+
+            # --- Phase 2: full pipeline ---
+            audio_path: Path = f
+            if config.convert.enabled:
+                _check_cancel(stop_event)
+                log("  [1] Конвертация в WAV...")
+                target = tmp_root / "convert.wav"
+                if config.overwrite or not target.exists():
+                    convert_to_wav(
+                        f, target,
+                        sample_rate=config.convert.sample_rate,
+                        channels=config.convert.channels,
+                        ffmpeg_path=config.convert.ffmpeg_path,
+                    )
+                audio_path = target
+                log("  ✓ convert.wav")
+
+            if config.separate.enabled:
+                _check_cancel(stop_event)
+                log("  [2] Отделение вокала...")
+                target = tmp_root / "vocals.wav"
+                with tempfile.TemporaryDirectory() as tmp:
+                    raw = separate_vocals(
+                        audio_path, Path(tmp),
+                        model=config.separate.model,
+                        isolate_stem=config.separate.isolate_stem,
+                        unblend_path=config.separate.unblend_path,
+                        custom_kernels=config.separate.custom_kernels,
+                    )
+                    shutil.move(str(raw), str(target))
+                audio_path = target
+                log("  ✓ vocals.wav")
+
+            if config.transcribe.enabled:
+                _check_cancel(stop_event)
+                log("  [3] Транскрибация...")
+                text = transcribe(
+                    audio_path,
+                    engine=config.transcribe.engine,
+                    model=config.transcribe.model,
+                    language=config.transcribe.language,
+                    device=config.transcribe.device,
+                    compute_type=config.transcribe.compute_type,
+                    batch_size=config.transcribe.batch_size,
+                    gigaam_provider=config.transcribe.gigaam_provider,
+                    local_files_only=config.transcribe.local_files_only,
+                )
+                source = config.transcribe.engine
+                log(f"  ✓ распознано {len(text)} символов")
+
+                if config.lyrics.enabled and config.lyrics.try_after_asr:
+                    matched = _try_post_asr_match(text, config, log)
+                    if matched:
+                        text = matched
+                        source = f"{source}+lrclib"
+
+                (tmp_root / "text.txt").write_text(text, encoding="utf-8")
+
+            metadata_dict = _build_metadata_dict(ident.metadata, ident.shazam, source)
+            if metadata_dict:
+                _write_metadata_json(tmp_root / "metadata.json", metadata_dict)
+
+            _persist_artifacts(
+                tmp_root, track_out, config,
+                has_text=text is not None,
+                has_metadata=bool(metadata_dict),
+                log=log,
+            )
+
+        except Cancelled:
+            log("⏹ Отменено")
+            break
+        except Exception as e:  # noqa: BLE001
+            error = f"{type(e).__name__}: {e}"
+            log(f"  ✗ Ошибка: {error}")
+        finally:
+            shutil.rmtree(tmp_root, ignore_errors=True)
+            if on_progress:
+                on_progress(idx, total, "file")
+            results.append(
+                FileResult(f, text, track_out if not error else None, error, source, metadata_dict)
+            )
+
+    _log_summary(results, log)
+    return results
+
+
+# ---------------------------------------------------------------- staged
+
+def _run_staged(
+    config: PipelineConfig,
+    files: list[Path],
+    log: LogFn,
+    on_progress: Optional[ProgressFn],
+    stop_event: Optional[threading.Event],
+) -> list[FileResult]:
+    output_root = Path(config.output_dir)
+    total = len(files)
+
+    state: dict[Path, dict] = {
+        f: {
+            "audio_path": f,
+            "ident": None,
+            "text": None,
+            "source": None,
+            "metadata_dict": None,
+            "error": None,
+            "resolved": False,
+        }
+        for f in files
+    }
+
+    def active() -> list[Path]:
+        return [f for f in files if state[f]["error"] is None and not state[f]["resolved"]]
+
+    def cancelled() -> bool:
+        return stop_event is not None and stop_event.is_set()
+
+    # --- Stage 0: identification ---
+    if config.shazam.enabled or config.lyrics.enabled:
+        log(f"\n══ Этап 0 · Идентификация ({total} файлов) ══")
+        ident_tmp = Path(tempfile.mkdtemp(prefix="at_ident_"))
+        try:
+            for i, f in enumerate(files, 1):
+                if cancelled():
+                    log("⏹ Отменено")
+                    break
+                if on_progress:
+                    on_progress(i, total, "identify")
+                try:
+                    ident = _identify_file(f, ident_tmp / f.stem, config, log)
+                    state[f]["ident"] = ident
+
+                    if not ident.needs_asr:
+                        state[f]["resolved"] = True
+                        state[f]["text"] = ident.text
+                        state[f]["source"] = ident.source
+                        state[f]["metadata_dict"] = _build_metadata_dict(
+                            ident.metadata, ident.shazam, ident.source,
+                        )
+                        # Persist resolved tracks right away
+                        track_out = output_root / f.stem
+                        track_out.mkdir(parents=True, exist_ok=True)
+                        if ident.text:
+                            (track_out / "text.txt").write_text(ident.text, encoding="utf-8")
+                        if state[f]["metadata_dict"]:
+                            _write_metadata_json(track_out / "metadata.json", state[f]["metadata_dict"])
+                        log(f"  ✓ {f.name} [{ident.source}]")
+                    else:
+                        log(f"  → {f.name} (нужен полный пайплайн)")
+                except Exception as e:  # noqa: BLE001
+                    state[f]["error"] = f"{type(e).__name__}: {e}"
+                    log(f"  ✗ {f.name}: {e}")
+        finally:
+            shutil.rmtree(ident_tmp, ignore_errors=True)
+
+    # --- Stage 1: convert ---
+    if config.convert.enabled and not cancelled():
+        todo = active()
+        log(f"\n══ Этап 1 · Конвертация ({len(todo)} файлов) ══")
+        for i, f in enumerate(todo, 1):
+            if cancelled():
+                log("⏹ Отменено")
+                break
+            if on_progress:
+                on_progress(i, len(todo), "convert")
+            try:
+                target = Path(tempfile.mkdtemp(prefix=f"at_{f.stem}_")) / "convert.wav"
+                if config.overwrite or not target.exists():
+                    convert_to_wav(
+                        f, target,
+                        sample_rate=config.convert.sample_rate,
+                        channels=config.convert.channels,
+                        ffmpeg_path=config.convert.ffmpeg_path,
+                    )
+                state[f]["audio_path"] = target
+                log(f"  ✓ {f.name}")
+            except Exception as e:  # noqa: BLE001
+                state[f]["error"] = f"{type(e).__name__}: {e}"
+                log(f"  ✗ {f.name}: {e}")
+
+    # ---- Stage 2: separate (batched) ----
+    if config.separate.enabled and not cancelled():
+        todo = active()
+        log(f"\n══ Этап 2/3 · Отделение вокала ({len(todo)} файлов) ══")
+        if not todo:
+            pass
+        elif len(todo) == 1:
+            # Single file — no batching advantage
+            f = todo[0]
+            if on_progress:
+                on_progress(1, 1, "separate")
+            try:
+                src = state[f]["audio_path"]
+                target = src.parent / "vocals.wav"
+                with tempfile.TemporaryDirectory() as tmp:
+                    raw = separate_vocals(
+                        src, Path(tmp),
+                        model=config.separate.model,
+                        isolate_stem=config.separate.isolate_stem,
+                        unblend_path=config.separate.unblend_path,
+                        custom_kernels=config.separate.custom_kernels,
+                    )
+                    shutil.move(str(raw), str(target))
+                state[f]["audio_path"] = target
+                log(f"  ✓ {f.name}")
+            except Exception as e:  # noqa: BLE001
+                state[f]["error"] = f"{type(e).__name__}: {e}"
+                log(f"  ✗ {f.name}: {e}")
+        else:
+            # Batch: one unblend invocation, model loaded once
+            input_wavs = [state[f]["audio_path"] for f in todo]
+            common_root = _common_parent(input_wavs)
+            log(f"  Батч: {len(todo)} файлов, один вызов unblend (модель загрузится один раз)")
+            if on_progress:
+                on_progress(0, len(todo), "separate")
+            try:
+                mapping = separate_vocals_batch(
+                    input_wavs,
+                    common_root,
+                    model=config.separate.model,
+                    isolate_stem=config.separate.isolate_stem,
+                    unblend_path=config.separate.unblend_path,
+                    custom_kernels=config.separate.custom_kernels,
+                    progress_callback=lambda p: on_progress(p, len(todo), "separate") if on_progress else None,
+                )
+                for f in todo:
+                    src = state[f]["audio_path"]
+                    vocal = mapping.get(src)
+                    if vocal is None:
+                        state[f]["error"] = "batch produced no output"
+                        log(f"  ✗ {f.name}: нет результата в батче")
+                        continue
+                    state[f]["audio_path"] = vocal
+                    log(f"  ✓ {f.name}")
+                if on_progress:
+                    on_progress(len(todo), len(todo), "separate")
+            except Exception as e:  # noqa: BLE001
+                log(f"  ✗ Батч упал: {e}")
+                log("  ↻ Fallback: по одному...")
+                for i, f in enumerate(todo, 1):
+                    if cancelled():
+                        break
+                    if on_progress:
+                        on_progress(i, len(todo), "separate")
+                    try:
+                        src = state[f]["audio_path"]
+                        target = src.parent / "vocals.wav"
+                        with tempfile.TemporaryDirectory() as tmp:
+                            raw = separate_vocals(
+                                src, Path(tmp),
+                                model=config.separate.model,
+                                isolate_stem=config.separate.isolate_stem,
+                                unblend_path=config.separate.unblend_path,
+                                custom_kernels=config.separate.custom_kernels,
+                            )
+                            shutil.move(str(raw), str(target))
+                        state[f]["audio_path"] = target
+                        log(f"  ✓ {f.name}")
+                    except Exception as inner:  # noqa: BLE001
+                        state[f]["error"] = f"{type(inner).__name__}: {inner}"
+                        log(f"  ✗ {f.name}: {inner}")
+
+    # --- Stage 3: transcribe ---
+    if config.transcribe.enabled and not cancelled():
+        todo = active()
+        log(f"\n══ Этап 3 · Транскрибация ({len(todo)} файлов) ══")
+        for i, f in enumerate(todo, 1):
+            if cancelled():
+                log("⏹ Отменено")
+                break
+            if on_progress:
+                on_progress(i, len(todo), "transcribe")
+            try:
+                text = transcribe(
+                    state[f]["audio_path"],
+                    engine=config.transcribe.engine,
+                    model=config.transcribe.model,
+                    language=config.transcribe.language,
+                    device=config.transcribe.device,
+                    compute_type=config.transcribe.compute_type,
+                    batch_size=config.transcribe.batch_size,
+                    gigaam_provider=config.transcribe.gigaam_provider,
+                    local_files_only=config.transcribe.local_files_only,
+                )
+                state[f]["text"] = text
+                state[f]["source"] = config.transcribe.engine
+                log(f"  ✓ {f.name} ({len(text)} символов)")
+            except Exception as e:  # noqa: BLE001
+                state[f]["error"] = f"{type(e).__name__}: {e}"
+                log(f"  ✗ {f.name}: {e}")
+
+    # --- Stage 4: post-ASR lyrics match + persist ---
+    if not cancelled():
+        log("\n══ Финализация ══")
+        for f in files:
+            s = state[f]
+            if s["error"] is not None:
+                continue
+            if s["resolved"]:
+                continue  # already persisted in identification pass
+
+            text = s["text"]
+            source = s["source"]
+
+            if text and config.lyrics.enabled and config.lyrics.try_after_asr:
+                matched = _try_post_asr_match(text, config, log)
+                if matched:
+                    text = matched
+                    source = f"{source}+lrclib"
+                    s["text"] = text
+                    s["source"] = source
+
+            ident = s["ident"]
+            metadata_dict = _build_metadata_dict(
+                ident.metadata, ident.shazam, source,
+            ) if ident else None
+            s["metadata_dict"] = metadata_dict
+
+            track_out = output_root / f.stem
+            track_out.mkdir(parents=True, exist_ok=True)
+
+            audio_work = s["audio_path"]
+            work_dir = audio_work.parent if isinstance(audio_work, Path) else track_out
+            if text:
+                (work_dir / "text.txt").write_text(text, encoding="utf-8")
+            if metadata_dict:
+                _write_metadata_json(work_dir / "metadata.json", metadata_dict)
+
+            _persist_artifacts(
+                work_dir, track_out, config,
+                has_text=text is not None,
+                has_metadata=bool(metadata_dict),
+                log=log,
+            )
+            log(f"  ✓ {f.name}")
+
+    # cleanup temp dirs
+    for f in files:
+        audio_path = state[f]["audio_path"]
+        if isinstance(audio_path, Path) and audio_path.parent.name.startswith(f"at_{f.stem}"):
+            shutil.rmtree(audio_path.parent, ignore_errors=True)
+
+    results = [
+        FileResult(
+            f,
+            state[f]["text"],
+            output_root / f.stem if state[f]["error"] is None else None,
+            state[f]["error"],
+            state[f]["source"],
+            state[f]["metadata_dict"],
+        )
+        for f in files
+    ]
+    _log_summary(results, log)
+    return results
+
+
+# ---------------------------------------------------------------- summary
+
+def _log_summary(results: list[FileResult], log: LogFn) -> None:
+    from collections import Counter
+    counts = Counter(r.source or ("error" if r.error else "no_result") for r in results)
+    log("\n══ Итог ══")
+    for src, n in sorted(counts.items(), key=lambda kv: -kv[1]):
+        log(f"  {src}: {n}")
+
+
+# =========================================
+# Файл: core/transcribe.py
+# =========================================
+
+"""Speech recognition via WhisperX or GigaAM (onnx-asr).
+
+Includes aggressive VRAM cleanup to prevent OOM on long batches,
+and automatic model reload if the CUDA context gets corrupted.
+"""
+from __future__ import annotations
+
+import gc
+import time
+from pathlib import Path
+from typing import Optional
+
+
+def _resolve_device(device: str) -> str:
+    if device in ("cuda", "cpu"):
+        return device
+    try:
+        import torch
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    except Exception:
+        return "cpu"
+
+
+def _retry(fn, attempts: int = 3, base_delay: float = 2.0):
+    last = None
+    for i in range(attempts):
+        try:
+            return fn()
+        except Exception as e:
+            last = e
+            if i < attempts - 1:
+                time.sleep(base_delay * (i + 1))
+    raise last
+
+
+class _WhisperXModels:
+    _cache: dict = {}
+
+    @classmethod
+    def get(cls, model_name: str, device: str, compute_type: Optional[str],
+            local_files_only: bool = False):
+        if compute_type is None:
+            compute_type = "int8_float16" if device == "cuda" else "int8"
+        key = (model_name, device, compute_type, local_files_only)
+        if key not in cls._cache:
+            import whisperx
+            print(f"  [ASR] loading WhisperX {model_name} on {device} "
+                  f"({compute_type}, local_files_only={local_files_only})...")
+
+            def load():
+                return whisperx.load_model(
+                    model_name, device,
+                    compute_type=compute_type,
+                    local_files_only=local_files_only,
+                )
+
+            cls._cache[key] = _retry(load)
+            print("  [ASR] model loaded.")
+        return cls._cache[key]
+
+
+class _GigaAMModels:
+    _cache: dict = {}
+
+    @classmethod
+    def get(cls, provider: str):
+        providers = {
+            "cuda": ["CUDAExecutionProvider"],
+            "cpu": ["CPUExecutionProvider"],
+            "auto": ["CUDAExecutionProvider", "CPUExecutionProvider"],
+        }.get(provider, ["CPUExecutionProvider"])
+        key = tuple(providers)
+        if key not in cls._cache:
+            import onnx_asr
+
+            def load():
+                return onnx_asr.load_model("gigaam-v3-ctc", providers=list(providers))
+
+            cls._cache[key] = _retry(load)
+        return cls._cache[key]
+
+
+def transcribe(
+    audio_path: Path,
+    engine: str = "whisperx",
+    model: str = "large-v3",
+    language: Optional[str] = "ru",
+    device: str = "auto",
+    compute_type: Optional[str] = None,
+    batch_size: int = 8,
+    gigaam_provider: str = "auto",
+    local_files_only: bool = False,
+    vad_filter: bool = True,
+) -> str:
+    device = _resolve_device(device)
+
+    if engine == "whisperx":
+        try:
+            return _transcribe_whisperx(
+                audio_path, model, language, device, compute_type,
+                batch_size, local_files_only, vad_filter,
+            )
+        except Exception as e:
+            err = str(e).lower()
+            if "out of memory" in err or "cuda" in err or "device ordinal" in err:
+                print(f"  [ASR] CUDA error: {e}. Clearing model cache and retrying...")
+                _WhisperXModels._cache.clear()
+                gc.collect()
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except ImportError:
+                    pass
+                return _transcribe_whisperx(
+                    audio_path, model, language, device, compute_type,
+                    batch_size, local_files_only, vad_filter,
+                )
+            raise
+
+    if engine == "gigaam":
+        return _transcribe_gigaam(audio_path, gigaam_provider)
+    raise ValueError(f"Unknown ASR engine: {engine!r}")
+
+
+def _transcribe_whisperx(
+    audio_path: Path,
+    model_name: str,
+    language: Optional[str],
+    device: str,
+    compute_type: Optional[str],
+    batch_size: int,
+    local_files_only: bool,
+    vad_filter: bool,
+) -> str:
+    import whisperx
+    model = _WhisperXModels.get(model_name, device, compute_type, local_files_only)
+    audio = whisperx.load_audio(str(audio_path))
+    result = model.transcribe(
+        audio,
+        batch_size=batch_size,
+        language=language,
+    )
+    
+    text = " ".join(seg["text"].strip() for seg in result["segments"]).strip()
+    
+    # Free VRAM aggressively to prevent fragmentation/OOM on long batches
+    del audio
+    del result
+    gc.collect()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except ImportError:
+        pass
+        
+    return text
+
+
+def _transcribe_gigaam(audio_path: Path, provider: str) -> str:
+    model = _GigaAMModels.get(provider)
+    return model.recognize(str(audio_path), channel="mean").strip()
+
+
+# =========================================
+# Файл: core/recognize.py
+# =========================================
+
+"""Audio fingerprinting via Shazam (unofficial, no API key needed).
+
+Wraps shazamlite. If Shazam can't identify the track — return None.
+Never raises on 'not found', only on missing dependency.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
+
+
+@dataclass
+class ShazamResult:
+    title: str
+    artist: str
+    album: Optional[str] = None
+    year: Optional[str] = None
+
+
+def recognize(audio_wav: Path) -> Optional[ShazamResult]:
+    """Run Shazam fingerprinting on a WAV file. Returns None if not found."""
+    try:
+        from shazamlite import Shazam
+    except ImportError as e:
+        raise RuntimeError(
+            "shazamlite не установлен. Установите: pip install shazamlite numpy soundfile"
+        ) from e
+
+    shazam = Shazam()
+    try:
+        track = shazam.recognize(str(audio_wav))
+    except Exception:
+        return None
+
+    if track is None:
+        return None
+
+    title = getattr(track, "title", None) or getattr(track, "track", None)
+    artist = getattr(track, "artist", None) or getattr(track, "subtitle", None)
+    album = getattr(track, "album", None)
+    year = getattr(track, "year", None) or getattr(track, "released", None)
+
+    if not title or not artist:
+        return None
+
+    return ShazamResult(
+        title=str(title),
+        artist=str(artist),
+        album=str(album) if album else None,
+        year=str(year) if year else None,
+    )
+
+
+# =========================================
+# Файл: core/lyrics.py
+# =========================================
+
+"""Lyrics lookup via LRCLIB (https://lrclib.net) — free, no API key.
+
+Rate limit: LRCLIB allows ~90 req/min with a proper User-Agent,
+~45 without. We throttle to 0.4s between requests (150/min theoretical,
+well within limits) and always send a UA.
+"""
+from __future__ import annotations
+
+import threading
+import time
+from dataclasses import dataclass
+from typing import Optional
+
+import requests
+
+
+DEFAULT_USER_AGENT = "audio-transcriber/1.0"
+_API_BASE = "https://lrclib.net/api"
+
+_throttle_lock = threading.Lock()
+_last_request_at = 0.0
+_MIN_INTERVAL = 0.4  # seconds
+
+
+@dataclass
+class LyricsMatch:
+    title: str
+    artist: str
+    lyrics: str
+    duration: Optional[float] = None
+
+
+def _throttle() -> None:
+    global _last_request_at
+    with _throttle_lock:
+        now = time.monotonic()
+        wait = _last_request_at + _MIN_INTERVAL - now
+        if wait > 0:
+            time.sleep(wait)
+        _last_request_at = time.monotonic()
+
+
+def _get(url: str, params: dict, user_agent: str, timeout: float = 10.0) -> Optional[dict]:
+    _throttle()
+    try:
+        resp = requests.get(
+            url, params=params,
+            headers={"User-Agent": user_agent},
+            timeout=timeout,
+        )
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        return resp.json()
+    except requests.RequestException:
+        return None
+
+
+def _make_match(item: dict) -> Optional[LyricsMatch]:
+    lyrics = item.get("plainLyrics") or item.get("syncedLyrics")
+    if not lyrics:
+        return None
+    return LyricsMatch(
+        title=item.get("trackName", ""),
+        artist=item.get("artistName", ""),
+        lyrics=lyrics.strip(),
+        duration=item.get("duration"),
+    )
+
+
+def search_by_identity(
+    title: Optional[str],
+    artist: Optional[str],
+    album: Optional[str] = None,
+    duration: Optional[float] = None,
+    user_agent: str = DEFAULT_USER_AGENT,
+    timeout: float = 10.0,
+) -> Optional[LyricsMatch]:
+    """Search LRCLIB by track metadata. Works even with messy tags."""
+    if not title and not artist:
+        return None
+
+    query = " ".join(filter(None, [artist or "", title or ""])).strip()
+    if not query:
+        return None
+
+    data = _get(f"{_API_BASE}/search", {"q": query}, user_agent, timeout)
+    if not isinstance(data, list) or not data:
+        return None
+
+    for item in data[:5]:
+        match = _make_match(item)
+        if match:
+            return match
+    return None
+
+
+def search_by_text(
+    query: str,
+    limit: int = 5,
+    user_agent: str = DEFAULT_USER_AGENT,
+    timeout: float = 10.0,
+) -> list[LyricsMatch]:
+    """Search LRCLIB by plain text (e.g. first words of recognized speech)."""
+    if not query or not query.strip():
+        return []
+    data = _get(f"{_API_BASE}/search", {"q": query.strip()}, user_agent, timeout)
+    if not isinstance(data, list):
+        return []
+    matches: list[LyricsMatch] = []
+    for item in data[:limit]:
+        match = _make_match(item)
+        if match:
+            matches.append(match)
+    return matches
+
+
+# =========================================
+# Файл: core/config.py
+# =========================================
+
+"""Pipeline configuration dataclasses with JSON save/load."""
+from __future__ import annotations
+
+import json
+from dataclasses import asdict, dataclass, field, fields
+from pathlib import Path
+from typing import Optional
+
+
+MODES = ("sequential", "staged")
+
+
+@dataclass
+class ConvertConfig:
+    enabled: bool = True
+    sample_rate: int = 44100
+    channels: int = 2
+    ffmpeg_path: str = "ffmpeg"
+
+
+@dataclass
+class SeparateConfig:
+    enabled: bool = True
+    model: str = "bs_roformer_anvuew"
+    isolate_stem: str = "vocals"
+    unblend_path: str = "unblend"
+    custom_kernels: bool = False
+
+
+@dataclass
+class TranscribeConfig:
+    enabled: bool = True
+    engine: str = "whisperx"
+    model: str = "large-v3"
+    language: Optional[str] = "ru"
+    device: str = "auto"
+    compute_type: Optional[str] = None
+    batch_size: int = 8
+    gigaam_provider: str = "auto"
+    local_files_only: bool = False
+
+
+@dataclass
+class ShazamConfig:
+    enabled: bool = False
+
+
+@dataclass
+class LyricsConfig:
+    enabled: bool = False
+    user_agent: str = "audio-transcriber/1.0"
+    timeout: float = 10.0
+    use_tags_first: bool = True
+    use_shazam_result: bool = True
+    try_after_asr: bool = True
+    fuzzy_threshold: float = 0.6          # difflib ratio, 0..1
+    transcribe_if_identified_no_lyrics: bool = True
+
+
+@dataclass
+class PipelineConfig:
+    input_dir: str = ""
+    output_dir: str = "transcribed"
+    recursive: bool = False
+    keep_intermediate: bool = True
+    overwrite: bool = True
+    mode: str = "sequential"
+
+    convert: ConvertConfig = field(default_factory=ConvertConfig)
+    separate: SeparateConfig = field(default_factory=SeparateConfig)
+    transcribe: TranscribeConfig = field(default_factory=TranscribeConfig)
+    shazam: ShazamConfig = field(default_factory=ShazamConfig)
+    lyrics: LyricsConfig = field(default_factory=LyricsConfig)
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), indent=2, ensure_ascii=False)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "PipelineConfig":
+        cfg = cls()
+        for top in fields(cls):
+            name = top.name
+            if name not in data:
+                continue
+            value = data[name]
+            current = getattr(cfg, name)
+            if hasattr(current, "__dataclass_fields__"):
+                sub = {f.name for f in fields(current)}
+                for k, v in value.items():
+                    if k in sub:
+                        setattr(current, k, v)
+            else:
+                setattr(cfg, name, value)
+        return cfg
+
+    @classmethod
+    def from_json(cls, text: str) -> "PipelineConfig":
+        return cls.from_dict(json.loads(text))
+
+    def save(self, path: Path) -> None:
+        Path(path).write_text(self.to_json(), encoding="utf-8")
+
+    @classmethod
+    def load(cls, path: Path) -> "PipelineConfig":
+        return cls.from_json(Path(path).read_text(encoding="utf-8"))
+
+
+# =========================================
+# Файл: README.md
+# =========================================
+
+# Audio Transcriber Combine
+
+Локальное десктоп-приложение для извлечения текста из аудио.
+
+## Этапы
+
+1. **convert** — любой аудиоформат → WAV через `ffmpeg` (настраиваемый sample rate / каналы).
+2. **separate** — отделение вокала через `unblend` (Mel-Band RoFormer).
+3. **transcribe** — ASR через **WhisperX** или **GigaAM** (onnx-asr).
+
+Каждый этап можно включать/выключать отдельно. Промежуточные файлы
+можно сохранять (по умолчанию — да) или удалять, оставляя только финальный
+результат последнего включённого этапа.
+
+## Раскладка результатов
+
+
+# =========================================
+# Файл: requirements.txt
+# =========================================
+
+# GUI
+PySide6>=6.6
+
+# ASR
+whisperx>=3.1
+onnx-asr>=0.4
+
+# Recognition & lyrics
+shazamlite>=0.1
+mutagen>=1.47
+requests>=2.31
+
+# WhisperX pulls torch; for CUDA you must install the matching torch build, e.g.:
+#   pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121
+# For cuDNN preload helper used in main.py:
+#   pip install nvidia-cudnn-cu12
+
+# System dependencies (not pip-installable):
+#   ffmpeg          — must be in PATH
+#   unblend         — vocal separation CLI (Mel-Band RoFormer), must be in PATH
+
+
+# =========================================
+# Файл: gui/main_window.py
+# =========================================
+
+"""Main application window — dark theme, mode selector, staged/sequential pipelines."""
+from __future__ import annotations
+
+import shutil
+from pathlib import Path
+from typing import Optional
+
+from PySide6.QtCore import Qt, QUrl
+from PySide6.QtGui import QColor, QDesktopServices
+from PySide6.QtWidgets import (
+    QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout, QGroupBox,
+    QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox,
+    QPlainTextEdit, QProgressBar, QPushButton, QSpinBox, QTabWidget,
+    QVBoxLayout, QWidget,
+)
+
+from core.config import (
+    ConvertConfig, LyricsConfig, PipelineConfig, SeparateConfig,
+    ShazamConfig, TranscribeConfig,
+)
+from gui.worker import PipelineWorker
+
+
+LANGUAGES = ["auto", "ru", "en", "de", "fr", "es", "it", "uk", "ja", "zh", "ko"]
+SAMPLE_RATES = [16000, 22050, 44100, 48000]
+ENGINES = ["whisperx", "gigaam"]
+
+STAGE_LABELS = {
+    "file": "Файлы",
+    "identify": "Идентификация",
+    "convert": "Конвертация",
+    "separate": "Отделение",
+    "transcribe": "Транскрибация",
+}
+
+MODE_LABELS = {
+    "sequential": "Последовательно (файл за файлом)",
+    "staged": "Пакетно (по этапам)",
+}
+
+
+def _detect_device_info() -> tuple[str, str]:
+    try:
+        import torch
+    except ImportError:
+        return "⚠ PyTorch не установлен", "#f38ba8"
+
+    if torch.cuda.is_available():
+        try:
+            name = torch.cuda.get_device_name(0)
+            vram = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+            return f"✓ CUDA: {name} · {vram:.1f} GB VRAM", "#a6e3a1"
+        except Exception:  # noqa: BLE001
+            return "✓ CUDA доступна", "#a6e3a1"
+
+    return "⚠ CUDA не обнаружена — расчёт пойдёт на CPU (медленно)", "#f9e2af"
+
+
+class MainWindow(QMainWindow):
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWindowTitle("Song Transcriber")
+        self.resize(1140, 880)
+        self._worker: Optional[PipelineWorker] = None
+        self._build_ui()
+        self._apply_defaults()
+        self._sync_tab_indicators()
+        self._sync_engine_fields()
+        self._log_device_info()
+
+    # ---------------- UI ----------------
+
+    def _build_ui(self) -> None:
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QVBoxLayout(central)
+        root.setContentsMargins(18, 16, 18, 16)
+        root.setSpacing(12)
+
+        header = QHBoxLayout()
+        title = QLabel("🎵 Song Transcriber")
+        title.setObjectName("appTitle")
+        header.addWidget(title)
+        header.addStretch(1)
+        self.device_label = QLabel("")
+        self.device_label.setObjectName("deviceInfo")
+        header.addWidget(self.device_label)
+        root.addLayout(header)
+
+        top_box = QGroupBox("Общие настройки")
+        top_layout = QFormLayout(top_box)
+        top_layout.setSpacing(10)
+
+        self.input_edit = QLineEdit()
+        top_layout.addRow("Входная папка:", self._with_browse(self.input_edit, self._pick_input_dir))
+
+        self.output_edit = QLineEdit()
+        top_layout.addRow("Выходная папка:", self._with_browse(self.output_edit, self._pick_output_dir))
+
+        self.mode_cb = QComboBox()
+        for key, label in MODE_LABELS.items():
+            self.mode_cb.addItem(label, key)
+        top_layout.addRow("Режим:", self.mode_cb)
+
+        opts = QHBoxLayout()
+        self.recursive_cb = QCheckBox("Рекурсивный обход")
+        self.keep_intermediate_cb = QCheckBox("Сохранять промежуточные")
+        self.overwrite_cb = QCheckBox("Перезаписывать")
+        opts.addWidget(self.recursive_cb)
+        opts.addWidget(self.keep_intermediate_cb)
+        opts.addWidget(self.overwrite_cb)
+        opts.addStretch(1)
+        top_layout.addRow("Опции:", opts)
+
+        root.addWidget(top_box)
+
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self._build_shazam_tab(), "Shazam")
+        self.tabs.addTab(self._build_lrclib_tab(), "LRCLIB")
+        self.tabs.addTab(self._build_convert_tab(), "Конвертация")
+        self.tabs.addTab(self._build_separate_tab(), "Отделение вокала")
+        self.tabs.addTab(self._build_transcribe_tab(), "Транскрибация")
+        root.addWidget(self.tabs)
+
+        self.shazam_enabled_cb.toggled.connect(self._sync_tab_indicators)
+        self.lyrics_enabled_cb.toggled.connect(self._sync_tab_indicators)
+        self.convert_enabled_cb.toggled.connect(self._sync_tab_indicators)
+        self.separate_enabled_cb.toggled.connect(self._sync_tab_indicators)
+        self.transcribe_enabled_cb.toggled.connect(self._sync_tab_indicators)
+        self.engine_cb.currentTextChanged.connect(self._sync_engine_fields)
+
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        self.start_btn = QPushButton("▶  Запустить")
+        self.start_btn.setObjectName("primary")
+        self.start_btn.clicked.connect(self._on_start)
+        self.stop_btn = QPushButton("⏹  Стоп")
+        self.stop_btn.setObjectName("danger")
+        self.stop_btn.setEnabled(False)
+        self.stop_btn.clicked.connect(self._on_stop)
+        self.open_out_btn = QPushButton("📂  Открыть результат")
+        self.open_out_btn.clicked.connect(self._open_output_dir)
+        self.save_preset_btn = QPushButton("💾  Сохранить пресет")
+        self.save_preset_btn.clicked.connect(self._save_preset)
+        self.load_preset_btn = QPushButton("📁  Загрузить пресет")
+        self.load_preset_btn.clicked.connect(self._load_preset)
+
+        row.addWidget(self.start_btn)
+        row.addWidget(self.stop_btn)
+        row.addStretch(1)
+        row.addWidget(self.open_out_btn)
+        row.addWidget(self.save_preset_btn)
+        row.addWidget(self.load_preset_btn)
+        root.addLayout(row)
+
+        self.progress = QProgressBar()
+        self.progress.setFormat("Ожидание")
+        root.addWidget(self.progress)
+
+        self.log_view = QPlainTextEdit()
+        self.log_view.setObjectName("log")
+        self.log_view.setReadOnly(True)
+        self.log_view.setPlaceholderText("Здесь появится лог выполнения…")
+        root.addWidget(self.log_view, 1)
+
+    def _with_browse(self, edit: QLineEdit, picker) -> QWidget:
+        w = QWidget()
+        h = QHBoxLayout(w)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(6)
+        h.addWidget(edit)
+        btn = QPushButton("…")
+        btn.setFixedWidth(36)
+        btn.clicked.connect(picker)
+        h.addWidget(btn)
+        return w
+
+    def _build_shazam_tab(self) -> QWidget:
+        w = QWidget()
+        form = QFormLayout(w)
+        form.setContentsMargins(16, 16, 16, 16)
+        form.setSpacing(10)
+
+        self.shazam_enabled_cb = QCheckBox("Включён")
+        form.addRow("", self.shazam_enabled_cb)
+
+        info = QLabel(
+            "Идентификация трека через Shazam (unofficial API).\n"
+            "При совпадении сохраняются метаданные и (если возможно) текст из LRCLIB.\n"
+            "Требует ffmpeg (для конвертации в 16 кГц моно)."
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet("color: #a6adc8;")
+        form.addRow(info)
+
+        return w
+
+    def _build_lrclib_tab(self) -> QWidget:
+        w = QWidget()
+        form = QFormLayout(w)
+        form.setContentsMargins(16, 16, 16, 16)
+        form.setSpacing(10)
+
+        self.lyrics_enabled_cb = QCheckBox("Включён")
+        form.addRow("", self.lyrics_enabled_cb)
+
+        self.lyrics_user_agent = QLineEdit()
+        form.addRow("User-Agent:", self.lyrics_user_agent)
+
+        self.lyrics_use_tags_cb = QCheckBox("Искать по тегам (artist + title)")
+        form.addRow("", self.lyrics_use_tags_cb)
+
+        self.lyrics_use_shazam_cb = QCheckBox("Искать по результату Shazam")
+        form.addRow("", self.lyrics_use_shazam_cb)
+
+        self.lyrics_after_asr_cb = QCheckBox("Проверять после ASR (fuzzy-match)")
+        form.addRow("", self.lyrics_after_asr_cb)
+
+        self.lyrics_transcribe_unresolved_cb = QCheckBox(
+            "Запускать ASR, если Shazam опознал, но текста нет"
+        )
+        form.addRow("", self.lyrics_transcribe_unresolved_cb)
+
+        self.lyrics_threshold = QDoubleSpinBox()
+        self.lyrics_threshold.setRange(0.0, 1.0)
+        self.lyrics_threshold.setSingleStep(0.05)
+        self.lyrics_threshold.setDecimals(2)
+        self.lyrics_threshold.setToolTip(
+            "Насколько должен совпасть распознанный ASR-текст с текстом из LRCLIB,\n"
+            "чтобы считать это тем же треком. 1.0 = точное совпадение, 0.0 = любое."
+        )
+        form.addRow("Порог fuzzy:", self.lyrics_threshold)
+
+        return w
+
+    def _build_convert_tab(self) -> QWidget:
+        w = QWidget()
+        form = QFormLayout(w)
+        form.setContentsMargins(16, 16, 16, 16)
+        form.setSpacing(10)
+
+        self.convert_enabled_cb = QCheckBox("Включён")
+        form.addRow("", self.convert_enabled_cb)
+
+        self.convert_sr = QComboBox()
+        for sr in SAMPLE_RATES:
+            self.convert_sr.addItem(f"{sr} Hz", sr)
+        form.addRow("Sample rate:", self.convert_sr)
+
+        self.convert_ch = QComboBox()
+        self.convert_ch.addItem("Моно", 1)
+        self.convert_ch.addItem("Стерео", 2)
+        form.addRow("Каналы:", self.convert_ch)
+
+        self.convert_ffmpeg = QLineEdit()
+        form.addRow("ffmpeg:", self.convert_ffmpeg)
+        return w
+
+    def _build_separate_tab(self) -> QWidget:
+        w = QWidget()
+        form = QFormLayout(w)
+        form.setContentsMargins(16, 16, 16, 16)
+        form.setSpacing(10)
+
+        self.separate_enabled_cb = QCheckBox("Включён")
+        form.addRow("", self.separate_enabled_cb)
+
+        self.separate_model = QLineEdit()
+        form.addRow("Модель:", self.separate_model)
+
+        self.separate_stem = QLineEdit()
+        form.addRow("Isolate stem:", self.separate_stem)
+
+        self.separate_unblend = QLineEdit()
+        form.addRow("unblend CLI:", self.separate_unblend)
+
+        self.separate_kernels_cb = QCheckBox("Использовать кастомные ядра")
+        form.addRow("", self.separate_kernels_cb)
+        return w
+
+    def _build_transcribe_tab(self) -> QWidget:
+        w = QWidget()
+        form = QFormLayout(w)
+        form.setContentsMargins(16, 16, 16, 16)
+        form.setSpacing(10)
+
+        self.transcribe_enabled_cb = QCheckBox("Включён")
+        form.addRow("", self.transcribe_enabled_cb)
+
+        self.engine_cb = QComboBox()
+        self.engine_cb.addItems(ENGINES)
+        form.addRow("Движок:", self.engine_cb)
+
+        self.model_edit = QLineEdit()
+        form.addRow("Модель:", self.model_edit)
+
+        self.lang_cb = QComboBox()
+        self.lang_cb.setEditable(True)
+        self.lang_cb.addItems(LANGUAGES)
+        self.lang_cb.setToolTip(
+            "'auto' — WhisperX определяет язык на каждом файле.\n"
+            "Если знаешь язык — выбери его явно, будет быстрее."
+        )
+        form.addRow("Язык:", self.lang_cb)
+
+        self.device_cb = QComboBox()
+        self.device_cb.addItems(["auto", "cuda", "cpu"])
+        form.addRow("Device:", self.device_cb)
+
+        self.compute_type_cb = QComboBox()
+        self.compute_type_cb.addItems(["auto", "int8_float16", "int8", "float16", "float32"])
+        form.addRow("Compute type:", self.compute_type_cb)
+
+        self.batch_spin = QSpinBox()
+        self.batch_spin.setRange(1, 512)
+        self.batch_spin.setToolTip(
+            "Размер батча сегментов ВНУТРИ одного файла (не файлов!).\n"
+            "8–16 для 8 ГБ VRAM, 32–64 для 24 ГБ."
+        )
+        form.addRow("Batch size:", self.batch_spin)
+
+        self.gigaam_provider_cb = QComboBox()
+        self.gigaam_provider_cb.addItems(["auto", "cuda", "cpu"])
+        form.addRow("GigaAM provider:", self.gigaam_provider_cb)
+
+        self.local_files_only_cb = QCheckBox("Не проверять HuggingFace (offline)")
+        self.local_files_only_cb.setToolTip(
+            "Если модель уже скачана — включите, чтобы не ждать сетевую проверку."
+        )
+        form.addRow("", self.local_files_only_cb)
+        return w
+
+    # ---------------- visual sync ----------------
+
+    def _log_device_info(self) -> None:
+        text, color = _detect_device_info()
+        self.device_label.setText(text)
+        self.device_label.setStyleSheet(f"color: {color};")
+        self._append_log(text)
+
+    def _sync_tab_indicators(self) -> None:
+        active = QColor("#89b4fa")
+        inactive = QColor("#585b70")
+        bar = self.tabs.tabBar()
+        bar.setTabTextColor(0, active if self.shazam_enabled_cb.isChecked() else inactive)
+        bar.setTabTextColor(1, active if self.lyrics_enabled_cb.isChecked() else inactive)
+        bar.setTabTextColor(2, active if self.convert_enabled_cb.isChecked() else inactive)
+        bar.setTabTextColor(3, active if self.separate_enabled_cb.isChecked() else inactive)
+        bar.setTabTextColor(4, active if self.transcribe_enabled_cb.isChecked() else inactive)
+
+    def _sync_engine_fields(self) -> None:
+        is_whisperx = self.engine_cb.currentText() == "whisperx"
+        for w in (self.lang_cb, self.device_cb, self.compute_type_cb, self.batch_spin):
+            w.setEnabled(is_whisperx)
+        self.gigaam_provider_cb.setEnabled(not is_whisperx)
+
+    # ---------------- defaults & config <-> UI ----------------
+
+    def _apply_defaults(self) -> None:
+        self._apply_config(PipelineConfig())
+
+    def _apply_config(self, cfg: PipelineConfig) -> None:
+        self.input_edit.setText(cfg.input_dir)
+        self.output_edit.setText(str(Path(cfg.output_dir).absolute()))
+        self.recursive_cb.setChecked(cfg.recursive)
+        self.keep_intermediate_cb.setChecked(cfg.keep_intermediate)
+        self.overwrite_cb.setChecked(cfg.overwrite)
+
+        i = self.mode_cb.findData(cfg.mode)
+        if i >= 0:
+            self.mode_cb.setCurrentIndex(i)
+
+        self.shazam_enabled_cb.setChecked(cfg.shazam.enabled)
+
+        self.lyrics_enabled_cb.setChecked(cfg.lyrics.enabled)
+        self.lyrics_user_agent.setText(cfg.lyrics.user_agent)
+        self.lyrics_use_tags_cb.setChecked(cfg.lyrics.use_tags_first)
+        self.lyrics_use_shazam_cb.setChecked(cfg.lyrics.use_shazam_result)
+        self.lyrics_after_asr_cb.setChecked(cfg.lyrics.try_after_asr)
+        self.lyrics_transcribe_unresolved_cb.setChecked(
+            cfg.lyrics.transcribe_if_identified_no_lyrics
+        )
+        self.lyrics_threshold.setValue(cfg.lyrics.fuzzy_threshold)
+
+        self.convert_enabled_cb.setChecked(cfg.convert.enabled)
+        i = self.convert_sr.findData(cfg.convert.sample_rate)
+        if i >= 0:
+            self.convert_sr.setCurrentIndex(i)
+        i = self.convert_ch.findData(cfg.convert.channels)
+        if i >= 0:
+            self.convert_ch.setCurrentIndex(i)
+        self.convert_ffmpeg.setText(cfg.convert.ffmpeg_path)
+
+        self.separate_enabled_cb.setChecked(cfg.separate.enabled)
+        self.separate_model.setText(cfg.separate.model)
+        self.separate_stem.setText(cfg.separate.isolate_stem)
+        self.separate_unblend.setText(cfg.separate.unblend_path)
+        self.separate_kernels_cb.setChecked(cfg.separate.custom_kernels)
+
+        self.transcribe_enabled_cb.setChecked(cfg.transcribe.enabled)
+        self.engine_cb.setCurrentText(cfg.transcribe.engine)
+        self.model_edit.setText(cfg.transcribe.model)
+        self.lang_cb.setCurrentText(cfg.transcribe.language or "auto")
+        self.device_cb.setCurrentText(cfg.transcribe.device)
+        self.compute_type_cb.setCurrentText(cfg.transcribe.compute_type or "auto")
+        self.batch_spin.setValue(cfg.transcribe.batch_size)
+        self.gigaam_provider_cb.setCurrentText(cfg.transcribe.gigaam_provider)
+        self.local_files_only_cb.setChecked(cfg.transcribe.local_files_only)
+
+    def _collect_config(self) -> PipelineConfig:
+        cfg = PipelineConfig()
+        cfg.input_dir = self.input_edit.text().strip()
+        cfg.output_dir = self.output_edit.text().strip() or "transcribed"
+        cfg.recursive = self.recursive_cb.isChecked()
+        cfg.keep_intermediate = self.keep_intermediate_cb.isChecked()
+        cfg.overwrite = self.overwrite_cb.isChecked()
+        cfg.mode = self.mode_cb.currentData()
+
+        cfg.shazam = ShazamConfig(enabled=self.shazam_enabled_cb.isChecked())
+
+        cfg.lyrics = LyricsConfig(
+            enabled=self.lyrics_enabled_cb.isChecked(),
+            user_agent=self.lyrics_user_agent.text().strip() or "audio-transcriber/1.0",
+            use_tags_first=self.lyrics_use_tags_cb.isChecked(),
+            use_shazam_result=self.lyrics_use_shazam_cb.isChecked(),
+            try_after_asr=self.lyrics_after_asr_cb.isChecked(),
+            transcribe_if_identified_no_lyrics=self.lyrics_transcribe_unresolved_cb.isChecked(),
+            fuzzy_threshold=float(self.lyrics_threshold.value()),
+        )
+
+        cfg.convert = ConvertConfig(
+            enabled=self.convert_enabled_cb.isChecked(),
+            sample_rate=int(self.convert_sr.currentData()),
+            channels=int(self.convert_ch.currentData()),
+            ffmpeg_path=self.convert_ffmpeg.text().strip() or "ffmpeg",
+        )
+        cfg.separate = SeparateConfig(
+            enabled=self.separate_enabled_cb.isChecked(),
+            model=self.separate_model.text().strip(),
+            isolate_stem=self.separate_stem.text().strip() or "vocals",
+            unblend_path=self.separate_unblend.text().strip() or "unblend",
+            custom_kernels=self.separate_kernels_cb.isChecked(),
+        )
+
+        lang = self.lang_cb.currentText().strip()
+        compute = self.compute_type_cb.currentText().strip()
+        cfg.transcribe = TranscribeConfig(
+            enabled=self.transcribe_enabled_cb.isChecked(),
+            engine=self.engine_cb.currentText(),
+            model=self.model_edit.text().strip() or "large-v3",
+            language=None if lang in ("", "auto") else lang,
+            device=self.device_cb.currentText(),
+            compute_type=None if compute == "auto" else compute,
+            batch_size=self.batch_spin.value(),
+            gigaam_provider=self.gigaam_provider_cb.currentText(),
+            local_files_only=self.local_files_only_cb.isChecked(),
+        )
+        return cfg
+
+    # ---------------- handlers ----------------
+
+    def _pick_input_dir(self) -> None:
+        d = QFileDialog.getExistingDirectory(self, "Выберите входную папку")
+        if d:
+            self.input_edit.setText(d)
+
+    def _pick_output_dir(self) -> None:
+        d = QFileDialog.getExistingDirectory(self, "Выберите выходную папку")
+        if d:
+            self.output_edit.setText(d)
+
+    def _open_output_dir(self) -> None:
+        p = Path(self.output_edit.text().strip() or "transcribed").absolute()
+        p.mkdir(parents=True, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(p)))
+
+    def _save_preset(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(self, "Сохранить пресет", "preset.json", "JSON (*.json)")
+        if not path:
+            return
+        try:
+            self._collect_config().save(Path(path))
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "Ошибка", str(exc))
+
+    def _load_preset(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Загрузить пресет", "", "JSON (*.json)")
+        if not path:
+            return
+        try:
+            self._apply_config(PipelineConfig.load(Path(path)))
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "Ошибка", str(exc))
+
+    def _on_start(self) -> None:
+        cfg = self._collect_config()
+        if not cfg.input_dir or not Path(cfg.input_dir).is_dir():
+            QMessageBox.warning(self, "Нет входной папки", "Выберите существующую входную папку.")
+            return
+        has_work = any([
+            cfg.shazam.enabled, cfg.lyrics.enabled,
+            cfg.convert.enabled, cfg.separate.enabled, cfg.transcribe.enabled,
+        ])
+        if not has_work:
+            QMessageBox.warning(self, "Нет этапов", "Включите хотя бы один этап.")
+            return
+        needs_ffmpeg = cfg.convert.enabled or cfg.shazam.enabled
+        if needs_ffmpeg and not shutil.which(cfg.convert.ffmpeg_path):
+            QMessageBox.warning(self, "ffmpeg не найден",
+                                f"Команда '{cfg.convert.ffmpeg_path}' не найдена в PATH.")
+            return
+        if cfg.separate.enabled and not shutil.which(cfg.separate.unblend_path):
+            QMessageBox.warning(self, "unblend не найден",
+                                f"Команда '{cfg.separate.unblend_path}' не найдена в PATH.")
+            return
+
+        self.log_view.clear()
+        self._log_device_info()
+        if cfg.transcribe.enabled and cfg.transcribe.language is None:
+            self._append_log("⚠ Язык = auto: WhisperX определит язык на каждом файле.")
+
+        self.progress.setValue(0)
+        self.progress.setFormat("Запуск…")
+        self.start_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+
+        self._worker = PipelineWorker(cfg)
+        self._worker.log.connect(self._append_log)
+        self._worker.progress.connect(self._on_progress)
+        self._worker.finished_ok.connect(self._on_finished)
+        self._worker.failed.connect(self._on_failed)
+        self._worker.start()
+
+    def _on_stop(self) -> None:
+        if self._worker is not None:
+            self._worker.stop()
+            self._append_log("⏹ Запрошена остановка…")
+
+    def _append_log(self, text: str) -> None:
+        self.log_view.appendPlainText(text)
+        sb = self.log_view.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
+    def _on_progress(self, done: int, total: int, stage: str) -> None:
+        self.progress.setMaximum(total)
+        self.progress.setValue(done)
+        label = STAGE_LABELS.get(stage, stage)
+        self.progress.setFormat(f"{label} — %v / %m")
+
+    def _on_finished(self, results: list) -> None:
+        self.start_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+        ok = sum(1 for r in results if r.error is None)
+        fail = len(results) - ok
+        self.progress.setFormat(f"Готово — успешно {ok}, с ошибкой {fail}")
+        self._append_log(f"\n✅ Готово. Успешно: {ok}, с ошибкой: {fail}.")
+
+    def _on_failed(self, message: str) -> None:
+        self.start_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+        self.progress.setFormat("Ошибка")
+        self._append_log(f"\n✗ Ошибка пайплайна: {message}")
+        QMessageBox.critical(self, "Ошибка", message)
+
+
+# =========================================
+# Файл: gui/worker.py
+# =========================================
+
+"""QThread wrapper around core.pipeline.run_pipeline."""
+from __future__ import annotations
+
+import threading
+
+from PySide6.QtCore import QThread, Signal
+
+from core.config import PipelineConfig
+from core.pipeline import run_pipeline
+
+
+class PipelineWorker(QThread):
+    log = Signal(str)
+    progress = Signal(int, int, str)   # done, total, stage
+    finished_ok = Signal(list)
+    failed = Signal(str)
+
+    def __init__(self, config: PipelineConfig, parent=None):
+        super().__init__(parent)
+        self._config = config
+        self._stop_event = threading.Event()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+
+    def run(self) -> None:
+        try:
+            results = run_pipeline(
+                self._config,
+                log=self.log.emit,
+                on_progress=lambda d, t, s: self.progress.emit(d, t, s),
+                stop_event=self._stop_event,
+            )
+            self.finished_ok.emit(results)
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(f"{type(exc).__name__}: {exc}")
+
+
+# =========================================
+# Файл: gui/init.py
+# =========================================
+
+"""Qt GUI package."""
+
+
+# =========================================
+# Файл: gui/theme.py
+# =========================================
+
+"""Dark theme for the whole application (Catppuccin Macchiato-inspired)."""
+from __future__ import annotations
+
+DARK_STYLESHEET = """
+QWidget {
+    background-color: #1e1e2e;
+    color: #cdd6f4;
+    font-family: 'Inter', 'Segoe UI', 'Noto Sans', sans-serif;
+    font-size: 10pt;
+}
+QMainWindow { background-color: #181825; }
+
+QLabel { background: transparent; }
+QLabel#appTitle {
+    font-size: 18pt;
+    font-weight: 700;
+    color: #89b4fa;
+    padding: 4px 0 10px 0;
+}
+QLabel#appSubtitle {
+    color: #7f849c;
+    font-size: 9pt;
+    padding-bottom: 12px;
+}
+QLabel#deviceInfo {
+    color: #a6adc8;
+    font-size: 9pt;
+    padding: 4px 8px;
+    background-color: #181825;
+    border: 1px solid #313244;
+    border-radius: 6px;
+}
+
+QGroupBox {
+    border: 1px solid #313244;
+    border-radius: 10px;
+    margin-top: 14px;
+    padding: 16px 12px 12px 12px;
+    background-color: #1e1e2e;
+    font-weight: 600;
+}
+QGroupBox::title {
+    subcontrol-origin: margin;
+    subcontrol-position: top left;
+    left: 12px;
+    padding: 0 6px;
+    color: #89b4fa;
+}
+
+QLineEdit, QSpinBox, QComboBox, QPlainTextEdit {
+    background-color: #181825;
+    border: 1px solid #313244;
+    border-radius: 6px;
+    padding: 6px 10px;
+    color: #cdd6f4;
+    selection-background-color: #89b4fa;
+    selection-color: #1e1e2e;
+    min-height: 22px;
+}
+QLineEdit:focus, QSpinBox:focus, QComboBox:focus, QPlainTextEdit:focus {
+    border: 1px solid #89b4fa;
+}
+QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled {
+    color: #585b70;
+    background-color: #11111b;
+}
+
+QComboBox::drop-down { border: none; width: 22px; }
+QComboBox::down-arrow {
+    width: 0; height: 0;
+    border-left: 4px solid transparent;
+    border-right: 4px solid transparent;
+    border-top: 5px solid #89b4fa;
+    margin-right: 8px;
+}
+QComboBox QAbstractItemView {
+    background-color: #181825;
+    border: 1px solid #313244;
+    selection-background-color: #313244;
+    selection-color: #89b4fa;
+    outline: none;
+}
+
+/* ─── buttons: higher contrast ─────────────────────────────────── */
+QPushButton {
+    background-color: #3d4159;
+    border: 1px solid #5c6080;
+    border-radius: 6px;
+    padding: 8px 16px;
+    color: #ffffff;
+    font-weight: 600;
+    min-height: 22px;
+}
+QPushButton:hover  { background-color: #4a4e6b; border-color: #7a7fa0; }
+QPushButton:pressed { background-color: #585b70; }
+QPushButton:focus  { border: 1px solid #a6c8ff; outline: none; }
+QPushButton:disabled {
+    background-color: #2a2d42;
+    color: #6c7086;
+    border-color: #3d4055;
+}
+
+QPushButton#primary {
+    background-color: #89b4fa;
+    color: #11111b;
+    font-weight: 700;
+    border: none;
+    padding: 8px 20px;
+}
+QPushButton#primary:hover   { background-color: #a6c8ff; }
+QPushButton#primary:pressed { background-color: #74a0e0; }
+QPushButton#primary:disabled {
+    background-color: #45475a;
+    color: #6c7086;
+}
+
+QPushButton#danger {
+    background-color: #f38ba8;
+    color: #11111b;
+    font-weight: 700;
+    border: none;
+    padding: 8px 20px;
+}
+QPushButton#danger:hover   { background-color: #f5a4b8; }
+QPushButton#danger:pressed { background-color: #e07898; }
+QPushButton#danger:disabled {
+    background-color: #45475a;
+    color: #6c7086;
+}
+
+QTabWidget::pane {
+    border: 1px solid #313244;
+    border-radius: 10px;
+    background-color: #1e1e2e;
+    top: -1px;
+}
+QTabBar::tab {
+    background-color: #181825;
+    color: #7f849c;
+    padding: 8px 20px;
+    border: 1px solid #313244;
+    border-bottom: none;
+    border-top-left-radius: 8px;
+    border-top-right-radius: 8px;
+    margin-right: 3px;
+    font-weight: 500;
+}
+QTabBar::tab:selected {
+    background-color: #1e1e2e;
+    color: #89b4fa;
+    border-color: #313244;
+}
+QTabBar::tab:hover:!selected { background-color: #252535; }
+
+QCheckBox {
+    spacing: 8px;
+    background: transparent;
+}
+QCheckBox::indicator {
+    width: 16px;
+    height: 16px;
+    border: 1px solid #5c6080;
+    border-radius: 4px;
+    background-color: #181825;
+}
+QCheckBox::indicator:hover { border-color: #89b4fa; }
+QCheckBox::indicator:checked {
+    background-color: #89b4fa;
+    border-color: #89b4fa;
+}
+
+QProgressBar {
+    background-color: #181825;
+    border: 1px solid #313244;
+    border-radius: 8px;
+    text-align: center;
+    color: #cdd6f4;
+    min-height: 24px;
+    max-height: 24px;
+    font-weight: 500;
+}
+QProgressBar::chunk {
+    background-color: #89b4fa;
+    border-radius: 7px;
+    margin: 1px;
+}
+
+QScrollBar:vertical {
+    background: #181825;
+    width: 12px;
+    border-radius: 6px;
+    margin: 0;
+}
+QScrollBar::handle:vertical {
+    background: #45475a;
+    border-radius: 6px;
+    min-height: 24px;
+    margin: 2px;
+}
+QScrollBar::handle:vertical:hover { background: #585b70; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none; }
+
+QSplitter::handle { background-color: #313244; }
+
+QPlainTextEdit#log {
+    background-color: #11111b;
+    border: 1px solid #313244;
+    border-radius: 10px;
+    padding: 10px;
+    font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+    font-size: 9.5pt;
+    color: #cdd6f4;
+}
+"""
+
+

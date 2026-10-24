@@ -19,6 +19,7 @@ import json
 import shutil
 import tempfile
 import threading
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
@@ -212,17 +213,40 @@ def _try_post_asr_match(
     config: PipelineConfig,
     log: LogFn,
 ) -> Optional[str]:
-    """Try to find the actual lyrics via LRCLIB using recognized text. Returns
-    the lyrics text on a confident match, else None."""
-    if not text or len(text.split()) < 3:
+    if not text:
         return None
 
-    head = _text_head(text, 8)
-    log(f"    LRCLIB по тексту: {head!r}...")
+    # Filter out common ASR watermarks/credits
+    ignore_phrases = ["субтитры", "редактор", "перевод", "сделал", "озвучка"]
+    lines = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if any(p in line.lower() for p in ignore_phrases):
+            continue
+        lines.append(line)
+
+    if not lines:
+        return None
+
+    # Take the first line with at least 3 words, strip punctuation
+    query = ""
+    for line in lines:
+        words = line.split()
+        if len(words) >= 3:
+            clean_words = [re.sub(r'[^\w\s]', '', w) for w in words]
+            query = " ".join(clean_words[:6])
+            break
+
+    if not query:
+        return None
+
+    log(f"    LRCLIB по тексту: {query!r}...")
 
     try:
         candidates = search_by_text(
-            head, limit=5,
+            query, limit=5,
             user_agent=config.lyrics.user_agent,
             timeout=config.lyrics.timeout,
         )
@@ -597,6 +621,7 @@ def _run_staged(
                     isolate_stem=config.separate.isolate_stem,
                     unblend_path=config.separate.unblend_path,
                     custom_kernels=config.separate.custom_kernels,
+                    progress_callback=lambda p: on_progress(p, len(todo), "separate") if on_progress else None,
                 )
                 for f in todo:
                     src = state[f]["audio_path"]
@@ -627,8 +652,8 @@ def _run_staged(
                                 isolate_stem=config.separate.isolate_stem,
                                 unblend_path=config.separate.unblend_path,
                                 custom_kernels=config.separate.custom_kernels,
-                             )
-                             shutil.move(str(raw), str(target))
+                            )
+                            shutil.move(str(raw), str(target))
                         state[f]["audio_path"] = target
                         log(f"  ✓ {f.name}")
                     except Exception as inner:  # noqa: BLE001
