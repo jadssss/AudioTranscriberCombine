@@ -28,7 +28,7 @@ from .convert import convert_to_wav
 from .lyrics import LyricsMatch, search_by_identity, search_by_text
 from .metadata import TrackMetadata, read_metadata
 from .recognize import ShazamResult, recognize
-from .separate import separate_vocals
+from .separate import separate_vocals, separate_vocals_batch
 from .transcribe import transcribe
 
 
@@ -59,6 +59,22 @@ class Cancelled(Exception):
 def collect_audio_files(input_dir: Path, recursive: bool) -> list[Path]:
     it = input_dir.rglob("*") if recursive else input_dir.iterdir()
     return sorted(p for p in it if p.is_file() and p.suffix.lower() in AUDIO_EXTENSIONS)
+
+
+def _common_parent(paths: list[Path]) -> Path:
+    """Return the deepest common parent directory of the given paths."""
+    if not paths:
+        raise ValueError("empty paths")
+    parts = [p.resolve().parts for p in paths]
+    common = []
+    for chunk in zip(*parts):
+        if all(c == chunk[0] for c in chunk):
+            common.append(chunk[0])
+        else:
+            break
+    if not common:
+        return paths[0].parent
+    return Path(*common)
 
 
 def _check_cancel(stop_event: Optional[threading.Event]) -> None:
@@ -538,16 +554,17 @@ def _run_staged(
                 state[f]["error"] = f"{type(e).__name__}: {e}"
                 log(f"  ✗ {f.name}: {e}")
 
-    # --- Stage 2: separate ---
+    # ---- Stage 2: separate (batched) ----
     if config.separate.enabled and not cancelled():
         todo = active()
-        log(f"\n══ Этап 2 · Отделение вокала ({len(todo)} файлов) ══")
-        for i, f in enumerate(todo, 1):
-            if cancelled():
-                log("⏹ Отменено")
-                break
+        log(f"\n══ Этап 2/3 · Отделение вокала ({len(todo)} файлов) ══")
+        if not todo:
+            pass
+        elif len(todo) == 1:
+            # Single file — no batching advantage
+            f = todo[0]
             if on_progress:
-                on_progress(i, len(todo), "separate")
+                on_progress(1, 1, "separate")
             try:
                 src = state[f]["audio_path"]
                 target = src.parent / "vocals.wav"
@@ -565,6 +582,58 @@ def _run_staged(
             except Exception as e:  # noqa: BLE001
                 state[f]["error"] = f"{type(e).__name__}: {e}"
                 log(f"  ✗ {f.name}: {e}")
+        else:
+            # Batch: one unblend invocation, model loaded once
+            input_wavs = [state[f]["audio_path"] for f in todo]
+            common_root = _common_parent(input_wavs)
+            log(f"  Батч: {len(todo)} файлов, один вызов unblend (модель загрузится один раз)")
+            if on_progress:
+                on_progress(0, len(todo), "separate")
+            try:
+                mapping = separate_vocals_batch(
+                    input_wavs,
+                    common_root,
+                    model=config.separate.model,
+                    isolate_stem=config.separate.isolate_stem,
+                    unblend_path=config.separate.unblend_path,
+                    custom_kernels=config.separate.custom_kernels,
+                )
+                for f in todo:
+                    src = state[f]["audio_path"]
+                    vocal = mapping.get(src)
+                    if vocal is None:
+                        state[f]["error"] = "batch produced no output"
+                        log(f"  ✗ {f.name}: нет результата в батче")
+                        continue
+                    state[f]["audio_path"] = vocal
+                    log(f"  ✓ {f.name}")
+                if on_progress:
+                    on_progress(len(todo), len(todo), "separate")
+            except Exception as e:  # noqa: BLE001
+                log(f"  ✗ Батч упал: {e}")
+                log("  ↻ Fallback: по одному...")
+                for i, f in enumerate(todo, 1):
+                    if cancelled():
+                        break
+                    if on_progress:
+                        on_progress(i, len(todo), "separate")
+                    try:
+                        src = state[f]["audio_path"]
+                        target = src.parent / "vocals.wav"
+                        with tempfile.TemporaryDirectory() as tmp:
+                            raw = separate_vocals(
+                                src, Path(tmp),
+                                model=config.separate.model,
+                                isolate_stem=config.separate.isolate_stem,
+                                unblend_path=config.separate.unblend_path,
+                                custom_kernels=config.separate.custom_kernels,
+                             )
+                             shutil.move(str(raw), str(target))
+                        state[f]["audio_path"] = target
+                        log(f"  ✓ {f.name}")
+                    except Exception as inner:  # noqa: BLE001
+                        state[f]["error"] = f"{type(inner).__name__}: {inner}"
+                        log(f"  ✗ {f.name}: {inner}")
 
     # --- Stage 3: transcribe ---
     if config.transcribe.enabled and not cancelled():
