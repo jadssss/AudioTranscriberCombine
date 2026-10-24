@@ -19,6 +19,7 @@ import json
 import shutil
 import tempfile
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -311,6 +312,129 @@ def _persist_artifacts(
 
 
 # ---------------------------------------------------------------- entry
+
+def _run_identification_parallel(
+    config: PipelineConfig,
+    files: list[Path],
+    log: LogFn,
+    on_progress: Optional[ProgressFn],
+    stop_event: Optional[threading.Event],
+    work_root: Path,
+) -> dict[Path, Optional[IdentifyResult]]:
+    """Parallel identification pass (tags → LRCLIB, Shazam, etc.)."""
+    if not (config.shazam.enabled or config.lyrics.enabled):
+        return {}
+
+    concurrency = max(1, int(config.shazam.identify_concurrency))
+    total = len(files)
+
+    if concurrency == 1 or total == 1:
+        results: dict[Path, Optional[IdentifyResult]] = {}
+        for i, f in enumerate(files, 1):
+            if stop_event is not None and stop_event.is_set():
+                break
+            if on_progress:
+                on_progress(i, total, "identify")
+            try:
+                results[f] = _identify_file(f, work_root / f.stem, config, log)
+            except Exception as e:  # noqa: BLE001
+                log(f"  ✗ {f.name} (identify): {e}")
+                results[f] = None
+        return results
+
+    log(f"  Идентификация: {total} файлов, конкурентность {concurrency}")
+
+    def worker(f: Path) -> tuple[Path, Optional[IdentifyResult]]:
+        if stop_event is not None and stop_event.is_set():
+            return f, None
+
+        def prefixed(msg: str) -> None:
+            log(f"  [{f.name}] {msg.strip()}")
+
+        try:
+            ident = _identify_file(f, work_root / f.stem, config, prefixed)
+            return f, ident
+        except Exception as e:  # noqa: BLE001
+            log(f"  ✗ {f.name} (identify): {e}")
+            return f, None
+
+    results: dict[Path, Optional[IdentifyResult]] = {}
+    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+        futures = {pool.submit(worker, f): f for f in files}
+        done = 0
+        for fut in as_completed(futures):
+            f = futures[fut]
+            try:
+                _, ident = fut.result()
+                results[f] = ident
+            except Exception as e:  # noqa: BLE001
+                log(f"  ✗ {f.name} (identify): {e}")
+                results[f] = None
+            done += 1
+            if on_progress:
+                on_progress(done, total, "identify")
+
+    return results
+
+
+def _run_convert_parallel(
+    config: PipelineConfig,
+    files: list[Path],
+    state: dict,
+    log: LogFn,
+    on_progress: Optional[ProgressFn],
+    stop_event: Optional[threading.Event],
+) -> None:
+    """Parallel convert stage. Writes state[f]['audio_path'] or state[f]['error']."""
+    concurrency = max(1, int(config.convert.convert_concurrency))
+    total = len(files)
+
+    def worker(f: Path) -> tuple[Path, Optional[Path], Optional[str]]:
+        if stop_event is not None and stop_event.is_set():
+            return f, None, None
+        try:
+            target = Path(tempfile.mkdtemp(prefix=f"at_{f.stem}_")) / "convert.wav"
+            if config.overwrite or not target.exists():
+                convert_to_wav(
+                    f, target,
+                    sample_rate=config.convert.sample_rate,
+                    channels=config.convert.channels,
+                    ffmpeg_path=config.convert.ffmpeg_path,
+                )
+            return f, target, None
+        except Exception as e:  # noqa: BLE001
+            return f, None, f"{type(e).__name__}: {e}"
+
+    if concurrency == 1 or total == 1:
+        for i, f in enumerate(files, 1):
+            if stop_event is not None and stop_event.is_set():
+                break
+            if on_progress:
+                on_progress(i, total, "convert")
+            f2, target, err = worker(f)
+            if err:
+                state[f2]["error"] = err
+                log(f"  ✗ {f2.name}: {err}")
+            else:
+                state[f2]["audio_path"] = target
+                log(f"  ✓ {f2.name}")
+        return
+
+    log(f"  Конвертация: {total} файлов, конкурентность {concurrency}")
+    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+        futures = {pool.submit(worker, f): f for f in files}
+        done = 0
+        for fut in as_completed(futures):
+            f2, target, err = fut.result()
+            if err:
+                state[f2]["error"] = err
+                log(f"  ✗ {f2.name}: {err}")
+            else:
+                state[f2]["audio_path"] = target
+                log(f"  ✓ {f2.name}")
+            done += 1
+            if on_progress:
+                on_progress(done, total, "convert")
 
 def run_pipeline(
     config: PipelineConfig,
@@ -668,8 +792,6 @@ def _run_staged(
             if cancelled():
                 log("⏹ Отменено")
                 break
-            if on_progress:
-                on_progress(i, len(todo), "transcribe")
             try:
                 text = transcribe(
                     state[f]["audio_path"],
@@ -688,6 +810,9 @@ def _run_staged(
             except Exception as e:  # noqa: BLE001
                 state[f]["error"] = f"{type(e).__name__}: {e}"
                 log(f"  ✗ {f.name}: {e}")
+            finally:
+                if on_progress:
+                    on_progress(i, len(todo), "transcribe")
 
     # --- Stage 4: post-ASR lyrics match + persist ---
     if not cancelled():

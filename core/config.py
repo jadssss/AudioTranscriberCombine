@@ -16,6 +16,7 @@ class ConvertConfig:
     sample_rate: int = 44100
     channels: int = 2
     ffmpeg_path: str = "ffmpeg"
+    convert_concurrency: int = 4
 
 
 @dataclass
@@ -43,6 +44,7 @@ class TranscribeConfig:
 @dataclass
 class ShazamConfig:
     enabled: bool = False
+    identify_concurrency: int = 4
 
 
 @dataclass
@@ -53,7 +55,7 @@ class LyricsConfig:
     use_tags_first: bool = True
     use_shazam_result: bool = True
     try_after_asr: bool = True
-    fuzzy_threshold: float = 0.6          # difflib ratio, 0..1
+    fuzzy_threshold: float = 0.6
     transcribe_if_identified_no_lyrics: bool = True
 
 

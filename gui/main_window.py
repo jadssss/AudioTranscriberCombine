@@ -182,6 +182,13 @@ class MainWindow(QMainWindow):
         form.setSpacing(10)
 
         self.shazam_enabled_cb = QCheckBox("Включён")
+        self.shazam_concurrency = QSpinBox()
+        self.shazam_concurrency.setRange(1, 16)
+        self.shazam_concurrency.setToolTip(
+            "Сколько файлов опознавать параллельно.\n"
+            "1 — последовательно, 4–8 — оптимум для Shazam."
+        )
+        form.addRow("Параллельных запросов:", self.shazam_concurrency)
         form.addRow("", self.shazam_enabled_cb)
 
         info = QLabel(
@@ -253,6 +260,13 @@ class MainWindow(QMainWindow):
         form.addRow("Каналы:", self.convert_ch)
 
         self.convert_ffmpeg = QLineEdit()
+        self.convert_concurrency = QSpinBox()
+        self.convert_concurrency.setRange(1, 16)
+        self.convert_concurrency.setToolTip(
+            "Сколько ffmpeg-процессов запускать одновременно.\n"
+            "Для SSD 4–8 нормально; для HDD лучше 1–2."
+        )
+        form.addRow("Параллельных конвертаций:", self.convert_concurrency)
         form.addRow("ffmpeg:", self.convert_ffmpeg)
         return w
 
@@ -371,6 +385,7 @@ class MainWindow(QMainWindow):
             self.mode_cb.setCurrentIndex(i)
 
         self.shazam_enabled_cb.setChecked(cfg.shazam.enabled)
+        self.shazam_concurrency.setValue(cfg.shazam.identify_concurrency)
 
         self.lyrics_enabled_cb.setChecked(cfg.lyrics.enabled)
         self.lyrics_user_agent.setText(cfg.lyrics.user_agent)
@@ -390,6 +405,7 @@ class MainWindow(QMainWindow):
         if i >= 0:
             self.convert_ch.setCurrentIndex(i)
         self.convert_ffmpeg.setText(cfg.convert.ffmpeg_path)
+        self.convert_concurrency.setValue(cfg.convert.convert_concurrency)
 
         self.separate_enabled_cb.setChecked(cfg.separate.enabled)
         self.separate_model.setText(cfg.separate.model)
@@ -416,7 +432,10 @@ class MainWindow(QMainWindow):
         cfg.overwrite = self.overwrite_cb.isChecked()
         cfg.mode = self.mode_cb.currentData()
 
-        cfg.shazam = ShazamConfig(enabled=self.shazam_enabled_cb.isChecked())
+        cfg.shazam = ShazamConfig(
+            enabled=self.shazam_enabled_cb.isChecked(),
+            identify_concurrency=self.shazam_concurrency.value(),
+        )
 
         cfg.lyrics = LyricsConfig(
             enabled=self.lyrics_enabled_cb.isChecked(),
@@ -433,6 +452,7 @@ class MainWindow(QMainWindow):
             sample_rate=int(self.convert_sr.currentData()),
             channels=int(self.convert_ch.currentData()),
             ffmpeg_path=self.convert_ffmpeg.text().strip() or "ffmpeg",
+            convert_concurrency=self.convert_concurrency.value(),
         )
         cfg.separate = SeparateConfig(
             enabled=self.separate_enabled_cb.isChecked(),

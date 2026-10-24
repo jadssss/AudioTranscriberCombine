@@ -113,19 +113,14 @@ USE OR OTHER DEALINGS IN THE SOFTWARE.
 # Файл: core/separate.py
 # =========================================
 
-"""Vocal separation via unblend (Mel-Band RoFormer).
-
-Two entry points:
-
-- separate_vocals()       single file, subprocess per call (sequential mode)
-- separate_vocals_batch() many files in ONE subprocess, model loaded once
-                          (staged mode — big speedup on batches)
-"""
+"""Vocal separation via unblend (Mel-Band RoFormer)."""
 from __future__ import annotations
 
 import os
 import subprocess
+import time
 from pathlib import Path
+from typing import Callable, Optional
 
 
 def _build_env(custom_kernels: bool) -> dict:
@@ -150,7 +145,6 @@ def separate_vocals(
     custom_kernels: bool = False,
     device: str = "cuda",
 ) -> Path:
-    """Separate one file. Returns path to the isolated stem WAV."""
     work_dir.mkdir(parents=True, exist_ok=True)
     output_pattern = work_dir / "{track}" / "{stem}.wav"
     cmd = [
@@ -179,14 +173,13 @@ def separate_vocals_batch(
     unblend_path: str = "unblend",
     custom_kernels: bool = False,
     device: str = "cuda",
+    progress_callback: Optional[Callable[[int], None]] = None,
 ) -> dict[Path, Path]:
     """Separate many files in one unblend invocation.
 
-    Input WAVs are expected to live in distinct directories
-    (e.g. <work_root>/<stem>/convert.wav). The output pattern uses {parent}
-    so each result lands next to its input as <parent>/vocals.wav.
-
-    Returns: {input_path: vocal_path}
+    unblend doesn't emit per-file progress, so progress_callback is called
+    with an incrementing counter roughly every 2 seconds, up to N-1.
+    The final N is always reported after the process exits.
     """
     if not input_wavs:
         return {}
@@ -203,8 +196,27 @@ def separate_vocals_batch(
         "--device", device,
     ]
 
-    result = subprocess.run(cmd, capture_output=True, text=True, env=_build_env(custom_kernels))
-    _check_result(result, f"{len(input_wavs)} files")
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=_build_env(custom_kernels),
+    )
+
+    total = len(input_wavs)
+    processed = 0
+    while proc.poll() is None:
+        if progress_callback and processed < total - 1:
+            if proc.wait(2.0) is not None:
+                break
+            processed += 1
+            progress_callback(processed)
+
+    if proc.returncode != 0:
+        raise RuntimeError(f"unblend batch failed with exit code {proc.returncode}")
+
+    if progress_callback:
+        progress_callback(total)
 
     mapping: dict[Path, Path] = {}
     missing: list[Path] = []
@@ -216,7 +228,6 @@ def separate_vocals_batch(
             missing.append(src)
 
     if missing:
-        # Fallback: search anywhere under work_root
         found = sorted(work_root.rglob(f"{isolate_stem}.wav"))
         if len(found) == len(input_wavs):
             for src, dst in zip(input_wavs, found):
@@ -360,6 +371,7 @@ import json
 import shutil
 import tempfile
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -652,6 +664,129 @@ def _persist_artifacts(
 
 
 # ---------------------------------------------------------------- entry
+
+def _run_identification_parallel(
+    config: PipelineConfig,
+    files: list[Path],
+    log: LogFn,
+    on_progress: Optional[ProgressFn],
+    stop_event: Optional[threading.Event],
+    work_root: Path,
+) -> dict[Path, Optional[IdentifyResult]]:
+    """Parallel identification pass (tags → LRCLIB, Shazam, etc.)."""
+    if not (config.shazam.enabled or config.lyrics.enabled):
+        return {}
+
+    concurrency = max(1, int(config.shazam.identify_concurrency))
+    total = len(files)
+
+    if concurrency == 1 or total == 1:
+        results: dict[Path, Optional[IdentifyResult]] = {}
+        for i, f in enumerate(files, 1):
+            if stop_event is not None and stop_event.is_set():
+                break
+            if on_progress:
+                on_progress(i, total, "identify")
+            try:
+                results[f] = _identify_file(f, work_root / f.stem, config, log)
+            except Exception as e:  # noqa: BLE001
+                log(f"  ✗ {f.name} (identify): {e}")
+                results[f] = None
+        return results
+
+    log(f"  Идентификация: {total} файлов, конкурентность {concurrency}")
+
+    def worker(f: Path) -> tuple[Path, Optional[IdentifyResult]]:
+        if stop_event is not None and stop_event.is_set():
+            return f, None
+
+        def prefixed(msg: str) -> None:
+            log(f"  [{f.name}] {msg.strip()}")
+
+        try:
+            ident = _identify_file(f, work_root / f.stem, config, prefixed)
+            return f, ident
+        except Exception as e:  # noqa: BLE001
+            log(f"  ✗ {f.name} (identify): {e}")
+            return f, None
+
+    results: dict[Path, Optional[IdentifyResult]] = {}
+    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+        futures = {pool.submit(worker, f): f for f in files}
+        done = 0
+        for fut in as_completed(futures):
+            f = futures[fut]
+            try:
+                _, ident = fut.result()
+                results[f] = ident
+            except Exception as e:  # noqa: BLE001
+                log(f"  ✗ {f.name} (identify): {e}")
+                results[f] = None
+            done += 1
+            if on_progress:
+                on_progress(done, total, "identify")
+
+    return results
+
+
+def _run_convert_parallel(
+    config: PipelineConfig,
+    files: list[Path],
+    state: dict,
+    log: LogFn,
+    on_progress: Optional[ProgressFn],
+    stop_event: Optional[threading.Event],
+) -> None:
+    """Parallel convert stage. Writes state[f]['audio_path'] or state[f]['error']."""
+    concurrency = max(1, int(config.convert.convert_concurrency))
+    total = len(files)
+
+    def worker(f: Path) -> tuple[Path, Optional[Path], Optional[str]]:
+        if stop_event is not None and stop_event.is_set():
+            return f, None, None
+        try:
+            target = Path(tempfile.mkdtemp(prefix=f"at_{f.stem}_")) / "convert.wav"
+            if config.overwrite or not target.exists():
+                convert_to_wav(
+                    f, target,
+                    sample_rate=config.convert.sample_rate,
+                    channels=config.convert.channels,
+                    ffmpeg_path=config.convert.ffmpeg_path,
+                )
+            return f, target, None
+        except Exception as e:  # noqa: BLE001
+            return f, None, f"{type(e).__name__}: {e}"
+
+    if concurrency == 1 or total == 1:
+        for i, f in enumerate(files, 1):
+            if stop_event is not None and stop_event.is_set():
+                break
+            if on_progress:
+                on_progress(i, total, "convert")
+            f2, target, err = worker(f)
+            if err:
+                state[f2]["error"] = err
+                log(f"  ✗ {f2.name}: {err}")
+            else:
+                state[f2]["audio_path"] = target
+                log(f"  ✓ {f2.name}")
+        return
+
+    log(f"  Конвертация: {total} файлов, конкурентность {concurrency}")
+    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+        futures = {pool.submit(worker, f): f for f in files}
+        done = 0
+        for fut in as_completed(futures):
+            f2, target, err = fut.result()
+            if err:
+                state[f2]["error"] = err
+                log(f"  ✗ {f2.name}: {err}")
+            else:
+                state[f2]["audio_path"] = target
+                log(f"  ✓ {f2.name}")
+            done += 1
+            if on_progress:
+                on_progress(done, total, "convert")
 
 def run_pipeline(
     config: PipelineConfig,
@@ -1476,6 +1611,7 @@ class ConvertConfig:
     sample_rate: int = 44100
     channels: int = 2
     ffmpeg_path: str = "ffmpeg"
+    convert_concurrency: int = 4
 
 
 @dataclass
@@ -1503,6 +1639,7 @@ class TranscribeConfig:
 @dataclass
 class ShazamConfig:
     enabled: bool = False
+    identify_concurrency: int = 4
 
 
 @dataclass
@@ -1513,7 +1650,7 @@ class LyricsConfig:
     use_tags_first: bool = True
     use_shazam_result: bool = True
     try_after_asr: bool = True
-    fuzzy_threshold: float = 0.6          # difflib ratio, 0..1
+    fuzzy_threshold: float = 0.6
     transcribe_if_identified_no_lyrics: bool = True
 
 
@@ -1803,6 +1940,13 @@ class MainWindow(QMainWindow):
         form.setSpacing(10)
 
         self.shazam_enabled_cb = QCheckBox("Включён")
+        self.shazam_concurrency = QSpinBox()
+        self.shazam_concurrency.setRange(1, 16)
+        self.shazam_concurrency.setToolTip(
+            "Сколько файлов опознавать параллельно.\n"
+            "1 — последовательно, 4–8 — оптимум для Shazam."
+        )
+        form.addRow("Параллельных запросов:", self.shazam_concurrency)
         form.addRow("", self.shazam_enabled_cb)
 
         info = QLabel(
@@ -1874,6 +2018,13 @@ class MainWindow(QMainWindow):
         form.addRow("Каналы:", self.convert_ch)
 
         self.convert_ffmpeg = QLineEdit()
+        self.convert_concurrency = QSpinBox()
+        self.convert_concurrency.setRange(1, 16)
+        self.convert_concurrency.setToolTip(
+            "Сколько ffmpeg-процессов запускать одновременно.\n"
+            "Для SSD 4–8 нормально; для HDD лучше 1–2."
+        )
+        form.addRow("Параллельных конвертаций:", self.convert_concurrency)
         form.addRow("ffmpeg:", self.convert_ffmpeg)
         return w
 
@@ -1992,6 +2143,7 @@ class MainWindow(QMainWindow):
             self.mode_cb.setCurrentIndex(i)
 
         self.shazam_enabled_cb.setChecked(cfg.shazam.enabled)
+        self.shazam_concurrency.setValue(cfg.shazam.identify_concurrency)
 
         self.lyrics_enabled_cb.setChecked(cfg.lyrics.enabled)
         self.lyrics_user_agent.setText(cfg.lyrics.user_agent)
@@ -2011,6 +2163,7 @@ class MainWindow(QMainWindow):
         if i >= 0:
             self.convert_ch.setCurrentIndex(i)
         self.convert_ffmpeg.setText(cfg.convert.ffmpeg_path)
+        self.convert_concurrency.setValue(cfg.convert.convert_concurrency)
 
         self.separate_enabled_cb.setChecked(cfg.separate.enabled)
         self.separate_model.setText(cfg.separate.model)
@@ -2037,7 +2190,10 @@ class MainWindow(QMainWindow):
         cfg.overwrite = self.overwrite_cb.isChecked()
         cfg.mode = self.mode_cb.currentData()
 
-        cfg.shazam = ShazamConfig(enabled=self.shazam_enabled_cb.isChecked())
+        cfg.shazam = ShazamConfig(
+            enabled=self.shazam_enabled_cb.isChecked(),
+            identify_concurrency=self.shazam_concurrency.value(),
+        )
 
         cfg.lyrics = LyricsConfig(
             enabled=self.lyrics_enabled_cb.isChecked(),
@@ -2054,6 +2210,7 @@ class MainWindow(QMainWindow):
             sample_rate=int(self.convert_sr.currentData()),
             channels=int(self.convert_ch.currentData()),
             ffmpeg_path=self.convert_ffmpeg.text().strip() or "ffmpeg",
+            convert_concurrency=self.convert_concurrency.value(),
         )
         cfg.separate = SeparateConfig(
             enabled=self.separate_enabled_cb.isChecked(),

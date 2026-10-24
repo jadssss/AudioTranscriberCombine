@@ -1,16 +1,11 @@
-"""Vocal separation via unblend (Mel-Band RoFormer).
-
-Two entry points:
-
-- separate_vocals()       single file, subprocess per call (sequential mode)
-- separate_vocals_batch() many files in ONE subprocess, model loaded once
-                          (staged mode — big speedup on batches)
-"""
+"""Vocal separation via unblend (Mel-Band RoFormer)."""
 from __future__ import annotations
 
 import os
 import subprocess
+import time
 from pathlib import Path
+from typing import Callable, Optional
 
 
 def _build_env(custom_kernels: bool) -> dict:
@@ -35,7 +30,6 @@ def separate_vocals(
     custom_kernels: bool = False,
     device: str = "cuda",
 ) -> Path:
-    """Separate one file. Returns path to the isolated stem WAV."""
     work_dir.mkdir(parents=True, exist_ok=True)
     output_pattern = work_dir / "{track}" / "{stem}.wav"
     cmd = [
@@ -64,14 +58,13 @@ def separate_vocals_batch(
     unblend_path: str = "unblend",
     custom_kernels: bool = False,
     device: str = "cuda",
+    progress_callback: Optional[Callable[[int], None]] = None,
 ) -> dict[Path, Path]:
     """Separate many files in one unblend invocation.
 
-    Input WAVs are expected to live in distinct directories
-    (e.g. <work_root>/<stem>/convert.wav). The output pattern uses {parent}
-    so each result lands next to its input as <parent>/vocals.wav.
-
-    Returns: {input_path: vocal_path}
+    unblend doesn't emit per-file progress, so progress_callback is called
+    with an incrementing counter roughly every 2 seconds, up to N-1.
+    The final N is always reported after the process exits.
     """
     if not input_wavs:
         return {}
@@ -88,8 +81,27 @@ def separate_vocals_batch(
         "--device", device,
     ]
 
-    result = subprocess.run(cmd, capture_output=True, text=True, env=_build_env(custom_kernels))
-    _check_result(result, f"{len(input_wavs)} files")
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=_build_env(custom_kernels),
+    )
+
+    total = len(input_wavs)
+    processed = 0
+    while proc.poll() is None:
+        if progress_callback and processed < total - 1:
+            if proc.wait(2.0) is not None:
+                break
+            processed += 1
+            progress_callback(processed)
+
+    if proc.returncode != 0:
+        raise RuntimeError(f"unblend batch failed with exit code {proc.returncode}")
+
+    if progress_callback:
+        progress_callback(total)
 
     mapping: dict[Path, Path] = {}
     missing: list[Path] = []
@@ -101,7 +113,6 @@ def separate_vocals_batch(
             missing.append(src)
 
     if missing:
-        # Fallback: search anywhere under work_root
         found = sorted(work_root.rglob(f"{isolate_stem}.wav"))
         if len(found) == len(input_wavs):
             for src, dst in zip(input_wavs, found):
