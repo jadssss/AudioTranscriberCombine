@@ -96,6 +96,8 @@ def separate_vocals_batch(
                 break
             processed += 1
             progress_callback(processed)
+        else:
+            proc.wait(2.0)
 
     if proc.returncode != 0:
         raise RuntimeError(f"unblend batch failed with exit code {proc.returncode}")

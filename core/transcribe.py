@@ -1,7 +1,7 @@
 """Speech recognition via WhisperX or GigaAM (onnx-asr).
 
-Includes aggressive VRAM cleanup to prevent OOM on long batches,
-and automatic model reload if the CUDA context gets corrupted.
+Also exposes `transcribe_aligned()` for word-level alignment (used by LRC).
+Models are cached; aggressive VRAM cleanup happens after each file.
 """
 from __future__ import annotations
 
@@ -33,6 +33,16 @@ def _retry(fn, attempts: int = 3, base_delay: float = 2.0):
     raise last
 
 
+def _free_vram() -> None:
+    gc.collect()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except ImportError:
+        pass
+
+
 class _WhisperXModels:
     _cache: dict = {}
 
@@ -56,6 +66,28 @@ class _WhisperXModels:
 
             cls._cache[key] = _retry(load)
             print("  [ASR] model loaded.")
+        return cls._cache[key]
+
+
+class _AlignModels:
+    _cache: dict = {}
+
+    @classmethod
+    def get(cls, language_code: str, device: str, model_name: Optional[str] = None):
+        key = (language_code, device, model_name or "")
+        if key not in cls._cache:
+            import whisperx
+            print(f"  [ALIGN] loading align model for {language_code} "
+                  f"({model_name or 'default'}) on {device}...")
+
+            def load():
+                kwargs = {"language_code": language_code, "device": device}
+                if model_name:
+                    kwargs["model_name"] = model_name
+                return whisperx.load_align_model(**kwargs)
+
+            cls._cache[key] = _retry(load)
+            print("  [ALIGN] align model loaded.")
         return cls._cache[key]
 
 
@@ -105,13 +137,7 @@ def transcribe(
             if "out of memory" in err or "cuda" in err or "device ordinal" in err:
                 print(f"  [ASR] CUDA error: {e}. Clearing model cache and retrying...")
                 _WhisperXModels._cache.clear()
-                gc.collect()
-                try:
-                    import torch
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                except ImportError:
-                    pass
+                _free_vram()
                 return _transcribe_whisperx(
                     audio_path, model, language, device, compute_type,
                     batch_size, local_files_only, vad_filter,
@@ -136,28 +162,52 @@ def _transcribe_whisperx(
     import whisperx
     model = _WhisperXModels.get(model_name, device, compute_type, local_files_only)
     audio = whisperx.load_audio(str(audio_path))
-    result = model.transcribe(
-        audio,
-        batch_size=batch_size,
-        language=language,
-    )
-    
+    result = model.transcribe(audio, batch_size=batch_size, language=language)
     text = " ".join(seg["text"].strip() for seg in result["segments"]).strip()
-    
-    # Free VRAM aggressively to prevent fragmentation/OOM on long batches
-    del audio
-    del result
-    gc.collect()
-    try:
-        import torch
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    except ImportError:
-        pass
-        
+    del audio, result
+    _free_vram()
     return text
 
 
 def _transcribe_gigaam(audio_path: Path, provider: str) -> str:
     model = _GigaAMModels.get(provider)
     return model.recognize(str(audio_path), channel="mean").strip()
+
+
+def transcribe_aligned(
+    audio_path: Path,
+    model: str = "large-v3",
+    language: Optional[str] = "ru",
+    device: str = "auto",
+    compute_type: Optional[str] = None,
+    batch_size: int = 8,
+    align_model: Optional[str] = None,
+    local_files_only: bool = False,
+) -> tuple[list[dict], str]:
+    """Transcribe + word-level align. Returns (aligned_segments, detected_language).
+
+    Each segment has 'start', 'end', 'text', and optionally 'words'.
+    Requires whisperx engine.
+    """
+    import whisperx
+    device = _resolve_device(device)
+    model_obj = _WhisperXModels.get(model, device, compute_type, local_files_only)
+    audio = whisperx.load_audio(str(audio_path))
+    result = model_obj.transcribe(audio, batch_size=batch_size, language=language)
+
+    detected = result.get("language") or language or "en"
+
+    try:
+        align_model_obj, align_metadata = _AlignModels.get(detected, device, align_model)
+        aligned = whisperx.align(
+            result["segments"], align_model_obj, align_metadata,
+            audio, device, return_char_alignments=False,
+        )
+        segments = aligned["segments"]
+    except Exception as e:
+        print(f"  [ALIGN] failed: {e}. Falling back to raw WhisperX segments.")
+        segments = result["segments"]
+
+    del audio, result
+    _free_vram()
+    return segments, detected

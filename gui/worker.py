@@ -1,4 +1,4 @@
-"""QThread wrapper around core.pipeline.run_pipeline."""
+"""QThread wrapper. Supports three task types: main, lrc, embed."""
 from __future__ import annotations
 
 import threading
@@ -6,7 +6,6 @@ import threading
 from PySide6.QtCore import QThread, Signal
 
 from core.config import PipelineConfig
-from core.pipeline import run_pipeline
 
 
 class PipelineWorker(QThread):
@@ -15,9 +14,10 @@ class PipelineWorker(QThread):
     finished_ok = Signal(list)
     failed = Signal(str)
 
-    def __init__(self, config: PipelineConfig, parent=None):
+    def __init__(self, config: PipelineConfig, task: str = "main", parent=None):
         super().__init__(parent)
         self._config = config
+        self._task = task
         self._stop_event = threading.Event()
 
     def stop(self) -> None:
@@ -25,7 +25,14 @@ class PipelineWorker(QThread):
 
     def run(self) -> None:
         try:
-            results = run_pipeline(
+            if self._task == "lrc":
+                from core.lrc_pipeline import run_lrc_pipeline as runner
+            elif self._task == "embed":
+                from core.lrc_pipeline import run_embed_pipeline as runner
+            else:
+                from core.pipeline import run_pipeline as runner
+
+            results = runner(
                 self._config,
                 log=self.log.emit,
                 on_progress=lambda d, t, s: self.progress.emit(d, t, s),

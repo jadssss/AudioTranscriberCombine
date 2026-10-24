@@ -26,6 +26,7 @@ class SeparateConfig:
     isolate_stem: str = "vocals"
     unblend_path: str = "unblend"
     custom_kernels: bool = False
+    save_vocals_copy: bool = False
 
 
 @dataclass
@@ -57,6 +58,19 @@ class LyricsConfig:
     try_after_asr: bool = True
     fuzzy_threshold: float = 0.6
     transcribe_if_identified_no_lyrics: bool = True
+    # NEW:
+    use_embedded_lyrics: bool = True     # read lyrics already stored in file tags first
+    save_unrecognized: bool = False      # write unresolved texts to JSONL for LRCLIB submission
+    unrecognized_path: str = ""          # "" = <output>/unrecognized_lyrics.jsonl
+
+
+@dataclass
+class LrcConfig:
+    language: Optional[str] = "ru"
+    align_model: Optional[str] = None
+    device: str = "auto"
+    audio_source: str = "auto"
+    embed_in_place: bool = False
 
 
 @dataclass
@@ -73,6 +87,7 @@ class PipelineConfig:
     transcribe: TranscribeConfig = field(default_factory=TranscribeConfig)
     shazam: ShazamConfig = field(default_factory=ShazamConfig)
     lyrics: LyricsConfig = field(default_factory=LyricsConfig)
+    lrc: LrcConfig = field(default_factory=LrcConfig)
 
     def to_dict(self) -> dict:
         return asdict(self)

@@ -1,4 +1,4 @@
-"""Main application window — dark theme, mode selector, staged/sequential pipelines."""
+"""Main application window — dark theme, mode selector, LRC tab."""
 from __future__ import annotations
 
 import shutil
@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (
 )
 
 from core.config import (
-    ConvertConfig, LyricsConfig, PipelineConfig, SeparateConfig,
+    ConvertConfig, LrcConfig, LyricsConfig, PipelineConfig, SeparateConfig,
     ShazamConfig, TranscribeConfig,
 )
 from gui.worker import PipelineWorker
@@ -31,6 +31,8 @@ STAGE_LABELS = {
     "convert": "Конвертация",
     "separate": "Отделение",
     "transcribe": "Транскрибация",
+    "lrc": "LRC",
+    "embed": "Встраивание LRC",
 }
 
 MODE_LABELS = {
@@ -44,7 +46,6 @@ def _detect_device_info() -> tuple[str, str]:
         import torch
     except ImportError:
         return "⚠ PyTorch не установлен", "#f38ba8"
-
     if torch.cuda.is_available():
         try:
             name = torch.cuda.get_device_name(0)
@@ -52,7 +53,6 @@ def _detect_device_info() -> tuple[str, str]:
             return f"✓ CUDA: {name} · {vram:.1f} GB VRAM", "#a6e3a1"
         except Exception:  # noqa: BLE001
             return "✓ CUDA доступна", "#a6e3a1"
-
     return "⚠ CUDA не обнаружена — расчёт пойдёт на CPU (медленно)", "#f9e2af"
 
 
@@ -60,7 +60,7 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Song Transcriber")
-        self.resize(1140, 880)
+        self.resize(1140, 920)
         self._worker: Optional[PipelineWorker] = None
         self._build_ui()
         self._apply_defaults()
@@ -93,7 +93,6 @@ class MainWindow(QMainWindow):
 
         self.input_edit = QLineEdit()
         top_layout.addRow("Входная папка:", self._with_browse(self.input_edit, self._pick_input_dir))
-
         self.output_edit = QLineEdit()
         top_layout.addRow("Выходная папка:", self._with_browse(self.output_edit, self._pick_output_dir))
 
@@ -111,7 +110,6 @@ class MainWindow(QMainWindow):
         opts.addWidget(self.overwrite_cb)
         opts.addStretch(1)
         top_layout.addRow("Опции:", opts)
-
         root.addWidget(top_box)
 
         self.tabs = QTabWidget()
@@ -120,6 +118,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self._build_convert_tab(), "Конвертация")
         self.tabs.addTab(self._build_separate_tab(), "Отделение вокала")
         self.tabs.addTab(self._build_transcribe_tab(), "Транскрибация")
+        self.tabs.addTab(self._build_lrc_tab(), "LRC")
         root.addWidget(self.tabs)
 
         self.shazam_enabled_cb.toggled.connect(self._sync_tab_indicators)
@@ -131,9 +130,9 @@ class MainWindow(QMainWindow):
 
         row = QHBoxLayout()
         row.setSpacing(10)
-        self.start_btn = QPushButton("▶  Запустить")
+        self.start_btn = QPushButton("▶  Запустить пайплайн")
         self.start_btn.setObjectName("primary")
-        self.start_btn.clicked.connect(self._on_start)
+        self.start_btn.clicked.connect(lambda: self._run_task("main"))
         self.stop_btn = QPushButton("⏹  Стоп")
         self.stop_btn.setObjectName("danger")
         self.stop_btn.setEnabled(False)
@@ -180,26 +179,18 @@ class MainWindow(QMainWindow):
         form = QFormLayout(w)
         form.setContentsMargins(16, 16, 16, 16)
         form.setSpacing(10)
-
         self.shazam_enabled_cb = QCheckBox("Включён")
         self.shazam_concurrency = QSpinBox()
         self.shazam_concurrency.setRange(1, 16)
-        self.shazam_concurrency.setToolTip(
-            "Сколько файлов опознавать параллельно.\n"
-            "1 — последовательно, 4–8 — оптимум для Shazam."
-        )
         form.addRow("Параллельных запросов:", self.shazam_concurrency)
         form.addRow("", self.shazam_enabled_cb)
-
         info = QLabel(
             "Идентификация трека через Shazam (unofficial API).\n"
-            "При совпадении сохраняются метаданные и (если возможно) текст из LRCLIB.\n"
-            "Требует ffmpeg (для конвертации в 16 кГц моно)."
+            "При совпадении сохраняются метаданные и (если возможно) текст из LRCLIB."
         )
         info.setWordWrap(True)
         info.setStyleSheet("color: #a6adc8;")
         form.addRow(info)
-
         return w
 
     def _build_lrclib_tab(self) -> QWidget:
@@ -207,37 +198,47 @@ class MainWindow(QMainWindow):
         form = QFormLayout(w)
         form.setContentsMargins(16, 16, 16, 16)
         form.setSpacing(10)
-
         self.lyrics_enabled_cb = QCheckBox("Включён")
         form.addRow("", self.lyrics_enabled_cb)
-
+        self.lyrics_use_embedded_cb = QCheckBox("Использовать встроенный текст из тегов (USLT/LYRICS/©lyr)")
+        self.lyrics_use_embedded_cb.setToolTip(
+            "Сначала проверяем, есть ли текст (LRC или обычный) уже в тегах аудио.\n"
+            "Если есть — ASR/Shazam/LRCLIB не запускаются."
+        )
+        form.addRow("", self.lyrics_use_embedded_cb)
         self.lyrics_user_agent = QLineEdit()
         form.addRow("User-Agent:", self.lyrics_user_agent)
-
-        self.lyrics_use_tags_cb = QCheckBox("Искать по тегам (artist + title)")
+        self.lyrics_use_tags_cb = QCheckBox("Искать по тегам")
         form.addRow("", self.lyrics_use_tags_cb)
-
-        self.lyrics_use_shazam_cb = QCheckBox("Искать по результату Shazam")
+        self.lyrics_use_shazam_cb = QCheckBox("Искать по Shazam")
         form.addRow("", self.lyrics_use_shazam_cb)
-
-        self.lyrics_after_asr_cb = QCheckBox("Проверять после ASR (fuzzy-match)")
+        self.lyrics_after_asr_cb = QCheckBox("Проверять после ASR (fuzzy)")
         form.addRow("", self.lyrics_after_asr_cb)
-
         self.lyrics_transcribe_unresolved_cb = QCheckBox(
-            "Запускать ASR, если Shazam опознал, но текста нет"
+            "ASR, если Shazam опознал без текста"
         )
         form.addRow("", self.lyrics_transcribe_unresolved_cb)
-
         self.lyrics_threshold = QDoubleSpinBox()
         self.lyrics_threshold.setRange(0.0, 1.0)
         self.lyrics_threshold.setSingleStep(0.05)
         self.lyrics_threshold.setDecimals(2)
-        self.lyrics_threshold.setToolTip(
-            "Насколько должен совпасть распознанный ASR-текст с текстом из LRCLIB,\n"
-            "чтобы считать это тем же треком. 1.0 = точное совпадение, 0.0 = любое."
-        )
         form.addRow("Порог fuzzy:", self.lyrics_threshold)
 
+        self.lyrics_save_unrecognized_cb = QCheckBox(
+            "Сохранять тексты без LRCLIB в JSONL (для добавления в LRCLIB)"
+        )
+        self.lyrics_save_unrecognized_cb.setToolTip(
+            "Если текст получен НЕ из LRCLIB (WhisperX / GigaAM / embedded), "
+            "записать его в <output>/unrecognized_lyrics.jsonl.\n"
+            "Формат совместим с LRCLIB API для ручной отправки."
+        )
+        form.addRow("", self.lyrics_save_unrecognized_cb)
+
+        self.lyrics_unrecognized_path_edit = QLineEdit()
+        self.lyrics_unrecognized_path_edit.setPlaceholderText(
+            "(пусто — <output>/unrecognized_lyrics.jsonl)"
+        )
+        form.addRow("Файл unrecognized:", self.lyrics_unrecognized_path_edit)
         return w
 
     def _build_convert_tab(self) -> QWidget:
@@ -245,27 +246,19 @@ class MainWindow(QMainWindow):
         form = QFormLayout(w)
         form.setContentsMargins(16, 16, 16, 16)
         form.setSpacing(10)
-
         self.convert_enabled_cb = QCheckBox("Включён")
         form.addRow("", self.convert_enabled_cb)
-
         self.convert_sr = QComboBox()
         for sr in SAMPLE_RATES:
             self.convert_sr.addItem(f"{sr} Hz", sr)
         form.addRow("Sample rate:", self.convert_sr)
-
         self.convert_ch = QComboBox()
         self.convert_ch.addItem("Моно", 1)
         self.convert_ch.addItem("Стерео", 2)
         form.addRow("Каналы:", self.convert_ch)
-
         self.convert_ffmpeg = QLineEdit()
         self.convert_concurrency = QSpinBox()
         self.convert_concurrency.setRange(1, 16)
-        self.convert_concurrency.setToolTip(
-            "Сколько ffmpeg-процессов запускать одновременно.\n"
-            "Для SSD 4–8 нормально; для HDD лучше 1–2."
-        )
         form.addRow("Параллельных конвертаций:", self.convert_concurrency)
         form.addRow("ffmpeg:", self.convert_ffmpeg)
         return w
@@ -275,21 +268,22 @@ class MainWindow(QMainWindow):
         form = QFormLayout(w)
         form.setContentsMargins(16, 16, 16, 16)
         form.setSpacing(10)
-
         self.separate_enabled_cb = QCheckBox("Включён")
         form.addRow("", self.separate_enabled_cb)
-
         self.separate_model = QLineEdit()
         form.addRow("Модель:", self.separate_model)
-
         self.separate_stem = QLineEdit()
         form.addRow("Isolate stem:", self.separate_stem)
-
         self.separate_unblend = QLineEdit()
         form.addRow("unblend CLI:", self.separate_unblend)
-
         self.separate_kernels_cb = QCheckBox("Использовать кастомные ядра")
         form.addRow("", self.separate_kernels_cb)
+        self.separate_save_vocals_cb = QCheckBox("Всегда сохранять vocals.wav в output")
+        self.separate_save_vocals_cb.setToolTip(
+            "Независимо от 'Сохранять промежуточные': вокал всегда будет лежать "
+            "в <output>/<stem>/vocals.wav — полезно для LRC-этапа."
+        )
+        form.addRow("", self.separate_save_vocals_cb)
         return w
 
     def _build_transcribe_tab(self) -> QWidget:
@@ -297,51 +291,88 @@ class MainWindow(QMainWindow):
         form = QFormLayout(w)
         form.setContentsMargins(16, 16, 16, 16)
         form.setSpacing(10)
-
         self.transcribe_enabled_cb = QCheckBox("Включён")
         form.addRow("", self.transcribe_enabled_cb)
-
         self.engine_cb = QComboBox()
         self.engine_cb.addItems(ENGINES)
         form.addRow("Движок:", self.engine_cb)
-
         self.model_edit = QLineEdit()
         form.addRow("Модель:", self.model_edit)
-
         self.lang_cb = QComboBox()
         self.lang_cb.setEditable(True)
         self.lang_cb.addItems(LANGUAGES)
-        self.lang_cb.setToolTip(
-            "'auto' — WhisperX определяет язык на каждом файле.\n"
-            "Если знаешь язык — выбери его явно, будет быстрее."
-        )
         form.addRow("Язык:", self.lang_cb)
-
         self.device_cb = QComboBox()
         self.device_cb.addItems(["auto", "cuda", "cpu"])
         form.addRow("Device:", self.device_cb)
-
         self.compute_type_cb = QComboBox()
         self.compute_type_cb.addItems(["auto", "int8_float16", "int8", "float16", "float32"])
         form.addRow("Compute type:", self.compute_type_cb)
-
         self.batch_spin = QSpinBox()
         self.batch_spin.setRange(1, 512)
-        self.batch_spin.setToolTip(
-            "Размер батча сегментов ВНУТРИ одного файла (не файлов!).\n"
-            "8–16 для 8 ГБ VRAM, 32–64 для 24 ГБ."
-        )
         form.addRow("Batch size:", self.batch_spin)
-
         self.gigaam_provider_cb = QComboBox()
         self.gigaam_provider_cb.addItems(["auto", "cuda", "cpu"])
         form.addRow("GigaAM provider:", self.gigaam_provider_cb)
-
         self.local_files_only_cb = QCheckBox("Не проверять HuggingFace (offline)")
-        self.local_files_only_cb.setToolTip(
-            "Если модель уже скачана — включите, чтобы не ждать сетевую проверку."
-        )
         form.addRow("", self.local_files_only_cb)
+        return w
+
+    def _build_lrc_tab(self) -> QWidget:
+        w = QWidget()
+        form = QFormLayout(w)
+        form.setContentsMargins(16, 16, 16, 16)
+        form.setSpacing(10)
+
+        info = QLabel(
+            "1) Сгенерировать LRC: WhisperX + align → <output>/<stem>/text.lrc.\n"
+            "2) Встроить LRC: записывает LRC в тег lyrics аудио (USLT/LYRICS/©lyr).\n"
+            "Если 'in-place' выключено — оригинал не трогается, создаётся копия в output."
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet("color: #a6adc8;")
+        form.addRow(info)
+
+        self.lrc_audio_source_cb = QComboBox()
+        self.lrc_audio_source_cb.addItems(["auto", "vocals", "convert", "input"])
+        self.lrc_audio_source_cb.setToolTip(
+            "auto: vocals.wav → convert.wav → 16k WAV из исходника.\n"
+            "vocals/convert: только соответствующий файл.\n"
+            "input: оригинальный mp3/flac."
+        )
+        form.addRow("Источник аудио:", self.lrc_audio_source_cb)
+
+        self.lrc_language_cb = QComboBox()
+        self.lrc_language_cb.setEditable(True)
+        self.lrc_language_cb.addItems(LANGUAGES)
+        form.addRow("Язык (для align):", self.lrc_language_cb)
+
+        self.lrc_align_model_edit = QLineEdit()
+        self.lrc_align_model_edit.setPlaceholderText("(пусто — whisperx по языку)")
+        form.addRow("Align модель:", self.lrc_align_model_edit)
+
+        self.lrc_device_cb = QComboBox()
+        self.lrc_device_cb.addItems(["auto", "cuda", "cpu"])
+        form.addRow("Device:", self.lrc_device_cb)
+
+        self.lrc_embed_in_place_cb = QCheckBox("Встраивать in-place (перезаписывать оригинал)")
+        self.lrc_embed_in_place_cb.setToolTip(
+            "Если выключено (по умолчанию) — создаётся копия в <output>/<stem>/<name>.\n"
+            "Если включено — оригинальный файл модифицируется."
+        )
+        form.addRow("", self.lrc_embed_in_place_cb)
+
+        btns = QHBoxLayout()
+        self.lrc_generate_btn = QPushButton("🎵  Сгенерировать LRC")
+        self.lrc_generate_btn.setObjectName("primary")
+        self.lrc_generate_btn.clicked.connect(lambda: self._run_task("lrc"))
+        self.lrc_embed_btn = QPushButton("📝  Встроить LRC в аудио")
+        self.lrc_embed_btn.clicked.connect(lambda: self._run_task("embed"))
+        btns.addWidget(self.lrc_generate_btn)
+        btns.addWidget(self.lrc_embed_btn)
+        btns.addStretch(1)
+        form.addRow("", btns)
+
         return w
 
     # ---------------- visual sync ----------------
@@ -379,7 +410,6 @@ class MainWindow(QMainWindow):
         self.recursive_cb.setChecked(cfg.recursive)
         self.keep_intermediate_cb.setChecked(cfg.keep_intermediate)
         self.overwrite_cb.setChecked(cfg.overwrite)
-
         i = self.mode_cb.findData(cfg.mode)
         if i >= 0:
             self.mode_cb.setCurrentIndex(i)
@@ -392,10 +422,11 @@ class MainWindow(QMainWindow):
         self.lyrics_use_tags_cb.setChecked(cfg.lyrics.use_tags_first)
         self.lyrics_use_shazam_cb.setChecked(cfg.lyrics.use_shazam_result)
         self.lyrics_after_asr_cb.setChecked(cfg.lyrics.try_after_asr)
-        self.lyrics_transcribe_unresolved_cb.setChecked(
-            cfg.lyrics.transcribe_if_identified_no_lyrics
-        )
+        self.lyrics_transcribe_unresolved_cb.setChecked(cfg.lyrics.transcribe_if_identified_no_lyrics)
         self.lyrics_threshold.setValue(cfg.lyrics.fuzzy_threshold)
+        self.lyrics_use_embedded_cb.setChecked(cfg.lyrics.use_embedded_lyrics)
+        self.lyrics_save_unrecognized_cb.setChecked(cfg.lyrics.save_unrecognized)
+        self.lyrics_unrecognized_path_edit.setText(cfg.lyrics.unrecognized_path)
 
         self.convert_enabled_cb.setChecked(cfg.convert.enabled)
         i = self.convert_sr.findData(cfg.convert.sample_rate)
@@ -412,6 +443,7 @@ class MainWindow(QMainWindow):
         self.separate_stem.setText(cfg.separate.isolate_stem)
         self.separate_unblend.setText(cfg.separate.unblend_path)
         self.separate_kernels_cb.setChecked(cfg.separate.custom_kernels)
+        self.separate_save_vocals_cb.setChecked(cfg.separate.save_vocals_copy)
 
         self.transcribe_enabled_cb.setChecked(cfg.transcribe.enabled)
         self.engine_cb.setCurrentText(cfg.transcribe.engine)
@@ -422,6 +454,12 @@ class MainWindow(QMainWindow):
         self.batch_spin.setValue(cfg.transcribe.batch_size)
         self.gigaam_provider_cb.setCurrentText(cfg.transcribe.gigaam_provider)
         self.local_files_only_cb.setChecked(cfg.transcribe.local_files_only)
+
+        self.lrc_audio_source_cb.setCurrentText(cfg.lrc.audio_source)
+        self.lrc_language_cb.setCurrentText(cfg.lrc.language or "auto")
+        self.lrc_align_model_edit.setText(cfg.lrc.align_model or "")
+        self.lrc_device_cb.setCurrentText(cfg.lrc.device)
+        self.lrc_embed_in_place_cb.setChecked(cfg.lrc.embed_in_place)
 
     def _collect_config(self) -> PipelineConfig:
         cfg = PipelineConfig()
@@ -436,7 +474,6 @@ class MainWindow(QMainWindow):
             enabled=self.shazam_enabled_cb.isChecked(),
             identify_concurrency=self.shazam_concurrency.value(),
         )
-
         cfg.lyrics = LyricsConfig(
             enabled=self.lyrics_enabled_cb.isChecked(),
             user_agent=self.lyrics_user_agent.text().strip() or "audio-transcriber/1.0",
@@ -445,8 +482,10 @@ class MainWindow(QMainWindow):
             try_after_asr=self.lyrics_after_asr_cb.isChecked(),
             transcribe_if_identified_no_lyrics=self.lyrics_transcribe_unresolved_cb.isChecked(),
             fuzzy_threshold=float(self.lyrics_threshold.value()),
+            use_embedded_lyrics=self.lyrics_use_embedded_cb.isChecked(),
+            save_unrecognized=self.lyrics_save_unrecognized_cb.isChecked(),
+            unrecognized_path=self.lyrics_unrecognized_path_edit.text().strip(),
         )
-
         cfg.convert = ConvertConfig(
             enabled=self.convert_enabled_cb.isChecked(),
             sample_rate=int(self.convert_sr.currentData()),
@@ -460,8 +499,8 @@ class MainWindow(QMainWindow):
             isolate_stem=self.separate_stem.text().strip() or "vocals",
             unblend_path=self.separate_unblend.text().strip() or "unblend",
             custom_kernels=self.separate_kernels_cb.isChecked(),
+            save_vocals_copy=self.separate_save_vocals_cb.isChecked(),
         )
-
         lang = self.lang_cb.currentText().strip()
         compute = self.compute_type_cb.currentText().strip()
         cfg.transcribe = TranscribeConfig(
@@ -474,6 +513,14 @@ class MainWindow(QMainWindow):
             batch_size=self.batch_spin.value(),
             gigaam_provider=self.gigaam_provider_cb.currentText(),
             local_files_only=self.local_files_only_cb.isChecked(),
+        )
+        lrc_lang = self.lrc_language_cb.currentText().strip()
+        cfg.lrc = LrcConfig(
+            language=None if lrc_lang in ("", "auto") else lrc_lang,
+            align_model=self.lrc_align_model_edit.text().strip() or None,
+            device=self.lrc_device_cb.currentText(),
+            audio_source=self.lrc_audio_source_cb.currentText(),
+            embed_in_place=self.lrc_embed_in_place_cb.isChecked(),
         )
         return cfg
 
@@ -512,39 +559,50 @@ class MainWindow(QMainWindow):
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "Ошибка", str(exc))
 
-    def _on_start(self) -> None:
+    def _set_busy(self, busy: bool) -> None:
+        self.start_btn.setEnabled(not busy)
+        self.lrc_generate_btn.setEnabled(not busy)
+        self.lrc_embed_btn.setEnabled(not busy)
+        self.stop_btn.setEnabled(busy)
+
+    def _run_task(self, task: str) -> None:
         cfg = self._collect_config()
         if not cfg.input_dir or not Path(cfg.input_dir).is_dir():
             QMessageBox.warning(self, "Нет входной папки", "Выберите существующую входную папку.")
             return
-        has_work = any([
-            cfg.shazam.enabled, cfg.lyrics.enabled,
-            cfg.convert.enabled, cfg.separate.enabled, cfg.transcribe.enabled,
-        ])
-        if not has_work:
-            QMessageBox.warning(self, "Нет этапов", "Включите хотя бы один этап.")
-            return
-        needs_ffmpeg = cfg.convert.enabled or cfg.shazam.enabled
-        if needs_ffmpeg and not shutil.which(cfg.convert.ffmpeg_path):
-            QMessageBox.warning(self, "ffmpeg не найден",
-                                f"Команда '{cfg.convert.ffmpeg_path}' не найдена в PATH.")
-            return
-        if cfg.separate.enabled and not shutil.which(cfg.separate.unblend_path):
-            QMessageBox.warning(self, "unblend не найден",
-                                f"Команда '{cfg.separate.unblend_path}' не найдена в PATH.")
+
+        if task == "main":
+            has_work = any([
+                cfg.shazam.enabled, cfg.lyrics.enabled,
+                cfg.convert.enabled, cfg.separate.enabled, cfg.transcribe.enabled,
+            ])
+            if not has_work:
+                QMessageBox.warning(self, "Нет этапов", "Включите хотя бы один этап.")
+                return
+            needs_ffmpeg = cfg.convert.enabled or cfg.shazam.enabled
+            if needs_ffmpeg and not shutil.which(cfg.convert.ffmpeg_path):
+                QMessageBox.warning(self, "ffmpeg не найден",
+                                    f"Команда '{cfg.convert.ffmpeg_path}' не найдена в PATH.")
+                return
+            if cfg.separate.enabled and not shutil.which(cfg.separate.unblend_path):
+                QMessageBox.warning(self, "unblend не найден",
+                                    f"Команда '{cfg.separate.unblend_path}' не найдена в PATH.")
+                return
+
+        if task == "lrc" and cfg.transcribe.engine != "whisperx":
+            QMessageBox.warning(
+                self, "LRC требует WhisperX",
+                "Align-модель доступна только для WhisperX. Переключите движок на whisperx."
+            )
             return
 
         self.log_view.clear()
         self._log_device_info()
-        if cfg.transcribe.enabled and cfg.transcribe.language is None:
-            self._append_log("⚠ Язык = auto: WhisperX определит язык на каждом файле.")
-
         self.progress.setValue(0)
         self.progress.setFormat("Запуск…")
-        self.start_btn.setEnabled(False)
-        self.stop_btn.setEnabled(True)
+        self._set_busy(True)
 
-        self._worker = PipelineWorker(cfg)
+        self._worker = PipelineWorker(cfg, task=task)
         self._worker.log.connect(self._append_log)
         self._worker.progress.connect(self._on_progress)
         self._worker.finished_ok.connect(self._on_finished)
@@ -568,16 +626,14 @@ class MainWindow(QMainWindow):
         self.progress.setFormat(f"{label} — %v / %m")
 
     def _on_finished(self, results: list) -> None:
-        self.start_btn.setEnabled(True)
-        self.stop_btn.setEnabled(False)
+        self._set_busy(False)
         ok = sum(1 for r in results if r.error is None)
         fail = len(results) - ok
         self.progress.setFormat(f"Готово — успешно {ok}, с ошибкой {fail}")
         self._append_log(f"\n✅ Готово. Успешно: {ok}, с ошибкой: {fail}.")
 
     def _on_failed(self, message: str) -> None:
-        self.start_btn.setEnabled(True)
-        self.stop_btn.setEnabled(False)
+        self._set_busy(False)
         self.progress.setFormat("Ошибка")
         self._append_log(f"\n✗ Ошибка пайплайна: {message}")
         QMessageBox.critical(self, "Ошибка", message)
