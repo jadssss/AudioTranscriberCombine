@@ -3,6 +3,10 @@
 Two modes:
   - sequential: for each file, run all enabled stages before moving to the next.
   - staged:     run stage 1 over all files, then stage 2 over all files, then stage 3.
+
+Intermediate artifacts (convert.wav, vocals.wav) are written to a temp dir and
+NEVER persisted to the output directory — unless `keep_intermediate=True`.
+Only the artifact of the LAST enabled stage is moved into `<output>/<stem>/`.
 """
 from __future__ import annotations
 
@@ -53,14 +57,15 @@ def collect_audio_files(input_dir: Path, recursive: bool) -> list[Path]:
     return sorted(p for p in it if p.is_file() and p.suffix.lower() in AUDIO_EXTENSIONS)
 
 
-def _final_stages(config: PipelineConfig) -> set[str]:
+def _final_stage(config: PipelineConfig) -> Optional[str]:
+    """The stage whose artifact is the final result (single element)."""
     if config.transcribe.enabled:
-        return {"transcribe"}
+        return "transcribe"
     if config.separate.enabled:
-        return {"separate"}
+        return "separate"
     if config.convert.enabled:
-        return {"convert"}
-    return set()
+        return "convert"
+    return None
 
 
 def _check_cancel(stop_event: Optional[threading.Event]) -> None:
@@ -68,20 +73,40 @@ def _check_cancel(stop_event: Optional[threading.Event]) -> None:
         raise Cancelled()
 
 
-def _cleanup_keeping(track_out: Path, finals: set[str]) -> None:
-    if not track_out.exists():
-        return
-    keep = {_ARTIFACT_NAMES[s] for s in finals if s in _ARTIFACT_NAMES}
-    for p in track_out.iterdir():
-        if p.name in keep:
-            continue
-        try:
-            if p.is_file():
-                p.unlink()
-            elif p.is_dir():
-                shutil.rmtree(p, ignore_errors=True)
-        except OSError:
-            pass
+def _persist_final(work_dir: Path, persist_dir: Path, final_stage: str, log: LogFn) -> None:
+    """Move the final-stage artifact from work_dir into persist_dir."""
+    name = _ARTIFACT_NAMES[final_stage]
+    src = work_dir / name
+    if not src.exists():
+        raise FileNotFoundError(f"Final artifact missing: {src}")
+    persist_dir.mkdir(parents=True, exist_ok=True)
+    dst = persist_dir / name
+    if dst.exists():
+        dst.unlink()
+    shutil.move(str(src), str(dst))
+    log(f"    [persist] {final_stage} -> {persist_dir.name}/{name}")
+
+
+def _work_dir_for(
+    config: PipelineConfig,
+    stem: str,
+    output_root: Path,
+    tmp_root: Optional[Path],
+) -> tuple[Path, Path]:
+    """Return (work_dir, persist_dir).
+
+    - keep_intermediate=True  -> work_dir == persist_dir == output_root/stem
+    - keep_intermediate=False -> work_dir = tmp_root/stem, persist_dir = output_root/stem
+    """
+    persist_dir = output_root / stem
+    if config.keep_intermediate:
+        persist_dir.mkdir(parents=True, exist_ok=True)
+        return persist_dir, persist_dir
+    if tmp_root is None:
+        raise ValueError("tmp_root required when keep_intermediate=False")
+    work_dir = tmp_root / stem
+    work_dir.mkdir(parents=True, exist_ok=True)
+    return work_dir, persist_dir
 
 
 # ---------------------------------------------------------------- entry
@@ -105,7 +130,10 @@ def run_pipeline(
         return []
 
     mode = (config.mode or "sequential").lower()
-    log(f"Найдено треков: {len(files)}   |   режим: {mode}")
+    log(f"Найдено треков: {len(files)}   |   режим: {mode}   |   "
+        f"keep_intermediate={config.keep_intermediate}")
+    if not config.keep_intermediate:
+        log("  Промежуточные файлы будут во временной папке и удалены после прогона.")
 
     if mode == "staged":
         return _run_staged(config, files, log, on_progress, stop_event)
@@ -122,8 +150,9 @@ def _run_sequential(
     stop_event: Optional[threading.Event],
 ) -> list[FileResult]:
     total = len(files)
-    finals = _final_stages(config)
+    final_stage = _final_stage(config)
     results: list[FileResult] = []
+    output_root = Path(config.output_dir)
 
     for idx, f in enumerate(files, 1):
         if stop_event is not None and stop_event.is_set():
@@ -133,18 +162,19 @@ def _run_sequential(
             on_progress(idx - 1, total, "file")
         log(f"\n▶ [{idx}/{total}] {f.name}")
 
-        track_out = Path(config.output_dir) / f.stem
-        track_out.mkdir(parents=True, exist_ok=True)
+        tmp_root = Path(tempfile.mkdtemp(prefix=f"at_{f.stem}_"))
+        work_dir, persist_dir = _work_dir_for(config, f.stem, output_root, tmp_root)
 
         audio_path: Path = f
         text: Optional[str] = None
         error: Optional[str] = None
+        processed_ok = False
 
         try:
             if config.convert.enabled:
                 _check_cancel(stop_event)
                 log("  [1] Конвертация в WAV...")
-                target = track_out / "convert.wav"
+                target = work_dir / "convert.wav"
                 if config.overwrite or not target.exists():
                     convert_to_wav(
                         f, target,
@@ -158,7 +188,7 @@ def _run_sequential(
             if config.separate.enabled:
                 _check_cancel(stop_event)
                 log("  [2] Отделение вокала...")
-                target = track_out / "vocals.wav"
+                target = work_dir / "vocals.wav"
                 with tempfile.TemporaryDirectory() as tmp:
                     raw = separate_vocals(
                         audio_path, Path(tmp),
@@ -183,23 +213,31 @@ def _run_sequential(
                     compute_type=config.transcribe.compute_type,
                     batch_size=config.transcribe.batch_size,
                     gigaam_provider=config.transcribe.gigaam_provider,
+                    local_files_only=config.transcribe.local_files_only,
+                    vad_filter=config.transcribe.vad_filter,
                 )
-                (track_out / "text.txt").write_text(text, encoding="utf-8")
+                (work_dir / "text.txt").write_text(text, encoding="utf-8")
                 log(f"  ✓ text.txt ({len(text)} символов)")
 
-            if not config.keep_intermediate:
-                _cleanup_keeping(track_out, finals)
+            processed_ok = True
 
         except Cancelled:
             log("⏹ Отменено")
             break
-        except Exception as e:  # noqa: BLE001 — per-file isolation
+        except Exception as e:  # noqa: BLE001
             error = f"{type(e).__name__}: {e}"
             log(f"  ✗ Ошибка: {error}")
         finally:
+            if processed_ok and not config.keep_intermediate and final_stage is not None:
+                try:
+                    _persist_final(work_dir, persist_dir, final_stage, log)
+                except Exception as e:  # noqa: BLE001
+                    error = f"persist failed: {e}"
+                    log(f"  ✗ {error}")
+            shutil.rmtree(tmp_root, ignore_errors=True)
             if on_progress:
                 on_progress(idx, total, "file")
-            results.append(FileResult(f, text, track_out if not error else None, error))
+            results.append(FileResult(f, text, persist_dir if not error else None, error))
 
     return results
 
@@ -215,20 +253,23 @@ def _run_staged(
 ) -> list[FileResult]:
     output_root = Path(config.output_dir)
     total = len(files)
+    final_stage = _final_stage(config)
 
-    # per-file state
-    state: dict[Path, dict] = {
-        f: {"audio_path": f, "track_out": None, "text": None, "error": None}
-        for f in files
-    }
+    # One tmp_root for the whole batch: stage 2 needs convert.wav of every file,
+    # stage 3 needs vocals.wav of every file. All of it is removed at the end.
+    tmp_root_ctx = tempfile.mkdtemp(prefix="at_staged_")
+    tmp_root = Path(tmp_root_ctx)
 
-    def track_out_for(f: Path) -> Path:
-        s = state[f]
-        if s["track_out"] is None:
-            p = output_root / f.stem
-            p.mkdir(parents=True, exist_ok=True)
-            s["track_out"] = p
-        return s["track_out"]
+    state: dict[Path, dict] = {}
+    for f in files:
+        work_dir, persist_dir = _work_dir_for(config, f.stem, output_root, tmp_root)
+        state[f] = {
+            "audio_path": f,
+            "work_dir": work_dir,
+            "persist_dir": persist_dir,
+            "text": None,
+            "error": None,
+        }
 
     def active() -> list[Path]:
         return [f for f in files if state[f]["error"] is None]
@@ -236,94 +277,110 @@ def _run_staged(
     def cancelled() -> bool:
         return stop_event is not None and stop_event.is_set()
 
-    # ---- Stage 1: convert ----
-    if config.convert.enabled:
-        log(f"\n══ Этап 1/3 · Конвертация ({total} файлов) ══")
-        for i, f in enumerate(files, 1):
-            if cancelled():
-                log("⏹ Отменено")
-                break
-            if on_progress:
-                on_progress(i, total, "convert")
-            try:
-                target = track_out_for(f) / "convert.wav"
-                if config.overwrite or not target.exists():
-                    convert_to_wav(
-                        f, target,
-                        sample_rate=config.convert.sample_rate,
-                        channels=config.convert.channels,
-                        ffmpeg_path=config.convert.ffmpeg_path,
+    try:
+        # ---- Stage 1: convert ----
+        if config.convert.enabled:
+            log(f"\n══ Этап 1/3 · Конвертация ({total} файлов) ══")
+            for i, f in enumerate(files, 1):
+                if cancelled():
+                    log("⏹ Отменено")
+                    break
+                if on_progress:
+                    on_progress(i, total, "convert")
+                try:
+                    target = state[f]["work_dir"] / "convert.wav"
+                    if config.overwrite or not target.exists():
+                        convert_to_wav(
+                            f, target,
+                            sample_rate=config.convert.sample_rate,
+                            channels=config.convert.channels,
+                            ffmpeg_path=config.convert.ffmpeg_path,
+                        )
+                    state[f]["audio_path"] = target
+                    log(f"  ✓ {f.name}")
+                except Exception as e:  # noqa: BLE001
+                    state[f]["error"] = f"{type(e).__name__}: {e}"
+                    log(f"  ✗ {f.name}: {e}")
+
+        # ---- Stage 2: separate ----
+        if config.separate.enabled and not cancelled():
+            todo = active()
+            log(f"\n══ Этап 2/3 · Отделение вокала ({len(todo)} файлов) ══")
+            for i, f in enumerate(todo, 1):
+                if cancelled():
+                    log("⏹ Отменено")
+                    break
+                if on_progress:
+                    on_progress(i, len(todo), "separate")
+                try:
+                    target = state[f]["work_dir"] / "vocals.wav"
+                    with tempfile.TemporaryDirectory() as tmp:
+                        raw = separate_vocals(
+                            state[f]["audio_path"], Path(tmp),
+                            model=config.separate.model,
+                            isolate_stem=config.separate.isolate_stem,
+                            unblend_path=config.separate.unblend_path,
+                            custom_kernels=config.separate.custom_kernels,
+                        )
+                        shutil.move(str(raw), str(target))
+                    state[f]["audio_path"] = target
+                    log(f"  ✓ {f.name}")
+                except Exception as e:  # noqa: BLE001
+                    state[f]["error"] = f"{type(e).__name__}: {e}"
+                    log(f"  ✗ {f.name}: {e}")
+
+        # ---- Stage 3: transcribe ----
+        if config.transcribe.enabled and not cancelled():
+            todo = active()
+            log(f"\n══ Этап 3/3 · Транскрибация ({len(todo)} файлов) ══")
+            for i, f in enumerate(todo, 1):
+                if cancelled():
+                    log("⏹ Отменено")
+                    break
+                if on_progress:
+                    on_progress(i, len(todo), "transcribe")
+                try:
+                    text = transcribe(
+                        state[f]["audio_path"],
+                        engine=config.transcribe.engine,
+                        model=config.transcribe.model,
+                        language=config.transcribe.language,
+                        device=config.transcribe.device,
+                        compute_type=config.transcribe.compute_type,
+                        batch_size=config.transcribe.batch_size,
+                        gigaam_provider=config.transcribe.gigaam_provider,
+                        local_files_only=config.transcribe.local_files_only,
+                        vad_filter=config.transcribe.vad_filter,
                     )
-                state[f]["audio_path"] = target
-                log(f"  ✓ {f.name}")
-            except Exception as e:  # noqa: BLE001
-                state[f]["error"] = f"{type(e).__name__}: {e}"
-                log(f"  ✗ {f.name}: {e}")
+                    (state[f]["work_dir"] / "text.txt").write_text(text, encoding="utf-8")
+                    state[f]["text"] = text
+                    log(f"  ✓ {f.name} ({len(text)} символов)")
+                except Exception as e:  # noqa: BLE001
+                    state[f]["error"] = f"{type(e).__name__}: {e}"
+                    log(f"  ✗ {f.name}: {e}")
 
-    # ---- Stage 2: separate ----
-    if config.separate.enabled and not cancelled():
-        todo = active()
-        log(f"\n══ Этап 2/3 · Отделение вокала ({len(todo)} файлов) ══")
-        for i, f in enumerate(todo, 1):
-            if cancelled():
-                log("⏹ Отменено")
-                break
-            if on_progress:
-                on_progress(i, len(todo), "separate")
-            try:
-                target = track_out_for(f) / "vocals.wav"
-                with tempfile.TemporaryDirectory() as tmp:
-                    raw = separate_vocals(
-                        state[f]["audio_path"], Path(tmp),
-                        model=config.separate.model,
-                        isolate_stem=config.separate.isolate_stem,
-                        unblend_path=config.separate.unblend_path,
-                        custom_kernels=config.separate.custom_kernels,
-                    )
-                    shutil.move(str(raw), str(target))
-                state[f]["audio_path"] = target
-                log(f"  ✓ {f.name}")
-            except Exception as e:  # noqa: BLE001
-                state[f]["error"] = f"{type(e).__name__}: {e}"
-                log(f"  ✗ {f.name}: {e}")
+        # ---- Persist final artifacts ----
+        if not config.keep_intermediate and final_stage is not None:
+            log(f"\n══ Перенос финальных файлов ({final_stage}) ══")
+            for f in files:
+                s = state[f]
+                if s["error"] is not None:
+                    continue
+                try:
+                    _persist_final(s["work_dir"], s["persist_dir"], final_stage, log)
+                except Exception as e:  # noqa: BLE001
+                    s["error"] = f"persist failed: {e}"
+                    log(f"  ✗ {f.name}: {e}")
 
-    # ---- Stage 3: transcribe ----
-    if config.transcribe.enabled and not cancelled():
-        todo = active()
-        log(f"\n══ Этап 3/3 · Транскрибация ({len(todo)} файлов) ══")
-        for i, f in enumerate(todo, 1):
-            if cancelled():
-                log("⏹ Отменено")
-                break
-            if on_progress:
-                on_progress(i, len(todo), "transcribe")
-            try:
-                text = transcribe(
-                    state[f]["audio_path"],
-                    engine=config.transcribe.engine,
-                    model=config.transcribe.model,
-                    language=config.transcribe.language,
-                    device=config.transcribe.device,
-                    compute_type=config.transcribe.compute_type,
-                    batch_size=config.transcribe.batch_size,
-                    gigaam_provider=config.transcribe.gigaam_provider,
-                )
-                (track_out_for(f) / "text.txt").write_text(text, encoding="utf-8")
-                state[f]["text"] = text
-                log(f"  ✓ {f.name} ({len(text)} символов)")
-            except Exception as e:  # noqa: BLE001
-                state[f]["error"] = f"{type(e).__name__}: {e}"
-                log(f"  ✗ {f.name}: {e}")
-
-    # ---- Cleanup ----
-    if not config.keep_intermediate:
-        finals = _final_stages(config)
-        for f in files:
-            s = state[f]
-            if s["error"] is None and s["track_out"] is not None:
-                _cleanup_keeping(s["track_out"], finals)
+    finally:
+        shutil.rmtree(tmp_root, ignore_errors=True)
 
     return [
-        FileResult(f, state[f]["text"], state[f]["track_out"], state[f]["error"])
+        FileResult(
+            f,
+            state[f]["text"],
+            state[f]["persist_dir"] if state[f]["error"] is None else None,
+            state[f]["error"],
+        )
         for f in files
     ]

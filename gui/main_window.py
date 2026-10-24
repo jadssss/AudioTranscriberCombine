@@ -267,6 +267,19 @@ class MainWindow(QMainWindow):
         self.gigaam_provider_cb = QComboBox()
         self.gigaam_provider_cb.addItems(["auto", "cuda", "cpu"])
         form.addRow("GigaAM provider:", self.gigaam_provider_cb)
+        self.local_files_only_cb = QCheckBox("Не проверять HuggingFace (offline)")
+        self.local_files_only_cb.setToolTip(
+            "Если модель уже скачана — включите, чтобы не ждать сетевую проверку.\n"
+            "При первом запуске (модели нет) оставьте выключенным."
+        )
+        form.addRow("", self.local_files_only_cb)
+
+        self.vad_filter_cb = QCheckBox("Использовать VAD (pyannote)")
+        self.vad_filter_cb.setChecked(True)
+        self.vad_filter_cb.setToolTip(
+            "Отключите, если загрузка модели виснет на 'Performing voice activity detection'."
+        )
+        form.addRow("", self.vad_filter_cb)
         return w
 
     # ---------------- visual sync ----------------
@@ -330,6 +343,8 @@ class MainWindow(QMainWindow):
         self.compute_type_cb.setCurrentText(cfg.transcribe.compute_type or "auto")
         self.batch_spin.setValue(cfg.transcribe.batch_size)
         self.gigaam_provider_cb.setCurrentText(cfg.transcribe.gigaam_provider)
+        self.local_files_only_cb.setChecked(cfg.transcribe.local_files_only)
+        self.vad_filter_cb.setChecked(cfg.transcribe.vad_filter)
 
     def _collect_config(self) -> PipelineConfig:
         cfg = PipelineConfig()
@@ -366,6 +381,8 @@ class MainWindow(QMainWindow):
             batch_size=self.batch_spin.value(),
             gigaam_provider=self.gigaam_provider_cb.currentText(),
         )
+        cfg.transcribe.local_files_only = self.local_files_only_cb.isChecked()
+        cfg.transcribe.vad_filter = self.vad_filter_cb.isChecked()
         return cfg
 
     # ---------------- handlers ----------------

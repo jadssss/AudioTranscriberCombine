@@ -26,7 +26,7 @@ def _retry(fn, attempts: int = 3, base_delay: float = 2.0):
     for i in range(attempts):
         try:
             return fn()
-        except Exception as e:  # noqa: BLE001 — HF download / SSL are broad
+        except Exception as e:  # noqa: BLE001
             last = e
             if i < attempts - 1:
                 time.sleep(base_delay * (i + 1))
@@ -37,17 +37,25 @@ class _WhisperXModels:
     _cache: dict = {}
 
     @classmethod
-    def get(cls, model_name: str, device: str, compute_type: Optional[str]):
+    def get(cls, model_name: str, device: str, compute_type: Optional[str],
+            local_files_only: bool = False):
         if compute_type is None:
             compute_type = "int8_float16" if device == "cuda" else "int8"
-        key = (model_name, device, compute_type)
+        key = (model_name, device, compute_type, local_files_only)
         if key not in cls._cache:
             import whisperx
+            print(f"  [ASR] loading WhisperX {model_name} on {device} "
+                  f"({compute_type}, local_files_only={local_files_only})...")
 
             def load():
-                return whisperx.load_model(model_name, device, compute_type=compute_type)
+                return whisperx.load_model(
+                    model_name, device,
+                    compute_type=compute_type,
+                    local_files_only=local_files_only,
+                )
 
             cls._cache[key] = _retry(load)
+            print("  [ASR] model loaded.")
         return cls._cache[key]
 
 
@@ -81,10 +89,15 @@ def transcribe(
     compute_type: Optional[str] = None,
     batch_size: int = 8,
     gigaam_provider: str = "auto",
+    local_files_only: bool = False,
+    vad_filter: bool = True,
 ) -> str:
     device = _resolve_device(device)
     if engine == "whisperx":
-        return _transcribe_whisperx(audio_path, model, language, device, compute_type, batch_size)
+        return _transcribe_whisperx(
+            audio_path, model, language, device, compute_type,
+            batch_size, local_files_only, vad_filter,
+        )
     if engine == "gigaam":
         return _transcribe_gigaam(audio_path, gigaam_provider)
     raise ValueError(f"Unknown ASR engine: {engine!r}")
@@ -97,11 +110,17 @@ def _transcribe_whisperx(
     device: str,
     compute_type: Optional[str],
     batch_size: int,
+    local_files_only: bool,
+    vad_filter: bool,
 ) -> str:
     import whisperx
-    model = _WhisperXModels.get(model_name, device, compute_type)
+    model = _WhisperXModels.get(model_name, device, compute_type, local_files_only)
     audio = whisperx.load_audio(str(audio_path))
-    result = model.transcribe(audio, batch_size=batch_size, language=language)
+    result = model.transcribe(
+        audio,
+        batch_size=batch_size,
+        language=language,
+    )
     return " ".join(seg["text"].strip() for seg in result["segments"]).strip()
 
 

@@ -30,13 +30,15 @@ class SeparateConfig:
 @dataclass
 class TranscribeConfig:
     enabled: bool = True
-    engine: str = "whisperx"           # "whisperx" | "gigaam"
+    engine: str = "whisperx"
     model: str = "large-v3"
-    language: Optional[str] = "ru"     # None = autodetect
-    device: str = "auto"               # "cuda" | "cpu" | "auto"
-    compute_type: Optional[str] = None  # None = auto
+    language: Optional[str] = "ru"
+    device: str = "auto"
+    compute_type: Optional[str] = None
     batch_size: int = 8
-    gigaam_provider: str = "auto"      # "auto" | "cuda" | "cpu"
+    gigaam_provider: str = "auto"
+    local_files_only: bool = False
+    vad_filter: bool = True
 
 
 @dataclass
