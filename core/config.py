@@ -38,7 +38,23 @@ class TranscribeConfig:
     batch_size: int = 8
     gigaam_provider: str = "auto"
     local_files_only: bool = False
-    vad_filter: bool = True
+
+
+@dataclass
+class ShazamConfig:
+    enabled: bool = False
+
+
+@dataclass
+class LyricsConfig:
+    enabled: bool = False
+    user_agent: str = "audio-transcriber/1.0"
+    timeout: float = 10.0
+    use_tags_first: bool = True
+    use_shazam_result: bool = True
+    try_after_asr: bool = True
+    fuzzy_threshold: float = 0.6          # difflib ratio, 0..1
+    transcribe_if_identified_no_lyrics: bool = True
 
 
 @dataclass
@@ -48,11 +64,13 @@ class PipelineConfig:
     recursive: bool = False
     keep_intermediate: bool = True
     overwrite: bool = True
-    mode: str = "sequential"           # "sequential" | "staged"
+    mode: str = "sequential"
 
     convert: ConvertConfig = field(default_factory=ConvertConfig)
     separate: SeparateConfig = field(default_factory=SeparateConfig)
     transcribe: TranscribeConfig = field(default_factory=TranscribeConfig)
+    shazam: ShazamConfig = field(default_factory=ShazamConfig)
+    lyrics: LyricsConfig = field(default_factory=LyricsConfig)
 
     def to_dict(self) -> dict:
         return asdict(self)

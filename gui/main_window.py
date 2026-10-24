@@ -8,13 +8,16 @@ from typing import Optional
 from PySide6.QtCore import Qt, QUrl
 from PySide6.QtGui import QColor, QDesktopServices
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QFileDialog, QFormLayout, QGroupBox,
+    QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout, QGroupBox,
     QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox,
     QPlainTextEdit, QProgressBar, QPushButton, QSpinBox, QTabWidget,
     QVBoxLayout, QWidget,
 )
 
-from core.config import ConvertConfig, PipelineConfig, SeparateConfig, TranscribeConfig
+from core.config import (
+    ConvertConfig, LyricsConfig, PipelineConfig, SeparateConfig,
+    ShazamConfig, TranscribeConfig,
+)
 from gui.worker import PipelineWorker
 
 
@@ -24,6 +27,7 @@ ENGINES = ["whisperx", "gigaam"]
 
 STAGE_LABELS = {
     "file": "Файлы",
+    "identify": "Идентификация",
     "convert": "Конвертация",
     "separate": "Отделение",
     "transcribe": "Транскрибация",
@@ -36,7 +40,6 @@ MODE_LABELS = {
 
 
 def _detect_device_info() -> tuple[str, str]:
-    """Return (display_text, color_hex) describing the compute device."""
     try:
         import torch
     except ImportError:
@@ -57,7 +60,7 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Song Transcriber")
-        self.resize(1100, 850)
+        self.resize(1140, 880)
         self._worker: Optional[PipelineWorker] = None
         self._build_ui()
         self._apply_defaults()
@@ -74,19 +77,16 @@ class MainWindow(QMainWindow):
         root.setContentsMargins(18, 16, 18, 16)
         root.setSpacing(12)
 
-        # --- header row: title + device badge ---
         header = QHBoxLayout()
         title = QLabel("🎵 Song Transcriber")
         title.setObjectName("appTitle")
         header.addWidget(title)
         header.addStretch(1)
-
         self.device_label = QLabel("")
         self.device_label.setObjectName("deviceInfo")
         header.addWidget(self.device_label)
         root.addLayout(header)
 
-        # --- top settings ---
         top_box = QGroupBox("Общие настройки")
         top_layout = QFormLayout(top_box)
         top_layout.setSpacing(10)
@@ -114,19 +114,21 @@ class MainWindow(QMainWindow):
 
         root.addWidget(top_box)
 
-        # --- stages ---
         self.tabs = QTabWidget()
+        self.tabs.addTab(self._build_shazam_tab(), "Shazam")
+        self.tabs.addTab(self._build_lrclib_tab(), "LRCLIB")
         self.tabs.addTab(self._build_convert_tab(), "Конвертация")
         self.tabs.addTab(self._build_separate_tab(), "Отделение вокала")
         self.tabs.addTab(self._build_transcribe_tab(), "Транскрибация")
         root.addWidget(self.tabs)
 
+        self.shazam_enabled_cb.toggled.connect(self._sync_tab_indicators)
+        self.lyrics_enabled_cb.toggled.connect(self._sync_tab_indicators)
         self.convert_enabled_cb.toggled.connect(self._sync_tab_indicators)
         self.separate_enabled_cb.toggled.connect(self._sync_tab_indicators)
         self.transcribe_enabled_cb.toggled.connect(self._sync_tab_indicators)
         self.engine_cb.currentTextChanged.connect(self._sync_engine_fields)
 
-        # --- controls row ---
         row = QHBoxLayout()
         row.setSpacing(10)
         self.start_btn = QPushButton("▶  Запустить")
@@ -136,7 +138,6 @@ class MainWindow(QMainWindow):
         self.stop_btn.setObjectName("danger")
         self.stop_btn.setEnabled(False)
         self.stop_btn.clicked.connect(self._on_stop)
-
         self.open_out_btn = QPushButton("📂  Открыть результат")
         self.open_out_btn.clicked.connect(self._open_output_dir)
         self.save_preset_btn = QPushButton("💾  Сохранить пресет")
@@ -152,12 +153,10 @@ class MainWindow(QMainWindow):
         row.addWidget(self.load_preset_btn)
         root.addLayout(row)
 
-        # --- progress ---
         self.progress = QProgressBar()
         self.progress.setFormat("Ожидание")
         root.addWidget(self.progress)
 
-        # --- log ---
         self.log_view = QPlainTextEdit()
         self.log_view.setObjectName("log")
         self.log_view.setReadOnly(True)
@@ -174,6 +173,64 @@ class MainWindow(QMainWindow):
         btn.setFixedWidth(36)
         btn.clicked.connect(picker)
         h.addWidget(btn)
+        return w
+
+    def _build_shazam_tab(self) -> QWidget:
+        w = QWidget()
+        form = QFormLayout(w)
+        form.setContentsMargins(16, 16, 16, 16)
+        form.setSpacing(10)
+
+        self.shazam_enabled_cb = QCheckBox("Включён")
+        form.addRow("", self.shazam_enabled_cb)
+
+        info = QLabel(
+            "Идентификация трека через Shazam (unofficial API).\n"
+            "При совпадении сохраняются метаданные и (если возможно) текст из LRCLIB.\n"
+            "Требует ffmpeg (для конвертации в 16 кГц моно)."
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet("color: #a6adc8;")
+        form.addRow(info)
+
+        return w
+
+    def _build_lrclib_tab(self) -> QWidget:
+        w = QWidget()
+        form = QFormLayout(w)
+        form.setContentsMargins(16, 16, 16, 16)
+        form.setSpacing(10)
+
+        self.lyrics_enabled_cb = QCheckBox("Включён")
+        form.addRow("", self.lyrics_enabled_cb)
+
+        self.lyrics_user_agent = QLineEdit()
+        form.addRow("User-Agent:", self.lyrics_user_agent)
+
+        self.lyrics_use_tags_cb = QCheckBox("Искать по тегам (artist + title)")
+        form.addRow("", self.lyrics_use_tags_cb)
+
+        self.lyrics_use_shazam_cb = QCheckBox("Искать по результату Shazam")
+        form.addRow("", self.lyrics_use_shazam_cb)
+
+        self.lyrics_after_asr_cb = QCheckBox("Проверять после ASR (fuzzy-match)")
+        form.addRow("", self.lyrics_after_asr_cb)
+
+        self.lyrics_transcribe_unresolved_cb = QCheckBox(
+            "Запускать ASR, если Shazam опознал, но текста нет"
+        )
+        form.addRow("", self.lyrics_transcribe_unresolved_cb)
+
+        self.lyrics_threshold = QDoubleSpinBox()
+        self.lyrics_threshold.setRange(0.0, 1.0)
+        self.lyrics_threshold.setSingleStep(0.05)
+        self.lyrics_threshold.setDecimals(2)
+        self.lyrics_threshold.setToolTip(
+            "Насколько должен совпасть распознанный ASR-текст с текстом из LRCLIB,\n"
+            "чтобы считать это тем же треком. 1.0 = точное совпадение, 0.0 = любое."
+        )
+        form.addRow("Порог fuzzy:", self.lyrics_threshold)
+
         return w
 
     def _build_convert_tab(self) -> QWidget:
@@ -241,8 +298,8 @@ class MainWindow(QMainWindow):
         self.lang_cb.setEditable(True)
         self.lang_cb.addItems(LANGUAGES)
         self.lang_cb.setToolTip(
-            "'auto' — WhisperX определяет язык на каждом файле отдельно.\n"
-            "Это заметно медленнее. Если знаешь язык — выбери его явно."
+            "'auto' — WhisperX определяет язык на каждом файле.\n"
+            "Если знаешь язык — выбери его явно, будет быстрее."
         )
         form.addRow("Язык:", self.lang_cb)
 
@@ -258,28 +315,19 @@ class MainWindow(QMainWindow):
         self.batch_spin.setRange(1, 512)
         self.batch_spin.setToolTip(
             "Размер батча сегментов ВНУТРИ одного файла (не файлов!).\n"
-            "Больше ≠ всегда быстрее: упирается в VRAM.\n"
-            "8–16 для 8 ГБ VRAM, 32–64 для 24 ГБ.\n"
-            "При 'CUDA out of memory' — уменьшайте."
+            "8–16 для 8 ГБ VRAM, 32–64 для 24 ГБ."
         )
         form.addRow("Batch size:", self.batch_spin)
 
         self.gigaam_provider_cb = QComboBox()
         self.gigaam_provider_cb.addItems(["auto", "cuda", "cpu"])
         form.addRow("GigaAM provider:", self.gigaam_provider_cb)
+
         self.local_files_only_cb = QCheckBox("Не проверять HuggingFace (offline)")
         self.local_files_only_cb.setToolTip(
-            "Если модель уже скачана — включите, чтобы не ждать сетевую проверку.\n"
-            "При первом запуске (модели нет) оставьте выключенным."
+            "Если модель уже скачана — включите, чтобы не ждать сетевую проверку."
         )
         form.addRow("", self.local_files_only_cb)
-
-        self.vad_filter_cb = QCheckBox("Использовать VAD (pyannote)")
-        self.vad_filter_cb.setChecked(True)
-        self.vad_filter_cb.setToolTip(
-            "Отключите, если загрузка модели виснет на 'Performing voice activity detection'."
-        )
-        form.addRow("", self.vad_filter_cb)
         return w
 
     # ---------------- visual sync ----------------
@@ -294,9 +342,11 @@ class MainWindow(QMainWindow):
         active = QColor("#89b4fa")
         inactive = QColor("#585b70")
         bar = self.tabs.tabBar()
-        bar.setTabTextColor(0, active if self.convert_enabled_cb.isChecked() else inactive)
-        bar.setTabTextColor(1, active if self.separate_enabled_cb.isChecked() else inactive)
-        bar.setTabTextColor(2, active if self.transcribe_enabled_cb.isChecked() else inactive)
+        bar.setTabTextColor(0, active if self.shazam_enabled_cb.isChecked() else inactive)
+        bar.setTabTextColor(1, active if self.lyrics_enabled_cb.isChecked() else inactive)
+        bar.setTabTextColor(2, active if self.convert_enabled_cb.isChecked() else inactive)
+        bar.setTabTextColor(3, active if self.separate_enabled_cb.isChecked() else inactive)
+        bar.setTabTextColor(4, active if self.transcribe_enabled_cb.isChecked() else inactive)
 
     def _sync_engine_fields(self) -> None:
         is_whisperx = self.engine_cb.currentText() == "whisperx"
@@ -319,6 +369,18 @@ class MainWindow(QMainWindow):
         i = self.mode_cb.findData(cfg.mode)
         if i >= 0:
             self.mode_cb.setCurrentIndex(i)
+
+        self.shazam_enabled_cb.setChecked(cfg.shazam.enabled)
+
+        self.lyrics_enabled_cb.setChecked(cfg.lyrics.enabled)
+        self.lyrics_user_agent.setText(cfg.lyrics.user_agent)
+        self.lyrics_use_tags_cb.setChecked(cfg.lyrics.use_tags_first)
+        self.lyrics_use_shazam_cb.setChecked(cfg.lyrics.use_shazam_result)
+        self.lyrics_after_asr_cb.setChecked(cfg.lyrics.try_after_asr)
+        self.lyrics_transcribe_unresolved_cb.setChecked(
+            cfg.lyrics.transcribe_if_identified_no_lyrics
+        )
+        self.lyrics_threshold.setValue(cfg.lyrics.fuzzy_threshold)
 
         self.convert_enabled_cb.setChecked(cfg.convert.enabled)
         i = self.convert_sr.findData(cfg.convert.sample_rate)
@@ -344,7 +406,6 @@ class MainWindow(QMainWindow):
         self.batch_spin.setValue(cfg.transcribe.batch_size)
         self.gigaam_provider_cb.setCurrentText(cfg.transcribe.gigaam_provider)
         self.local_files_only_cb.setChecked(cfg.transcribe.local_files_only)
-        self.vad_filter_cb.setChecked(cfg.transcribe.vad_filter)
 
     def _collect_config(self) -> PipelineConfig:
         cfg = PipelineConfig()
@@ -354,6 +415,18 @@ class MainWindow(QMainWindow):
         cfg.keep_intermediate = self.keep_intermediate_cb.isChecked()
         cfg.overwrite = self.overwrite_cb.isChecked()
         cfg.mode = self.mode_cb.currentData()
+
+        cfg.shazam = ShazamConfig(enabled=self.shazam_enabled_cb.isChecked())
+
+        cfg.lyrics = LyricsConfig(
+            enabled=self.lyrics_enabled_cb.isChecked(),
+            user_agent=self.lyrics_user_agent.text().strip() or "audio-transcriber/1.0",
+            use_tags_first=self.lyrics_use_tags_cb.isChecked(),
+            use_shazam_result=self.lyrics_use_shazam_cb.isChecked(),
+            try_after_asr=self.lyrics_after_asr_cb.isChecked(),
+            transcribe_if_identified_no_lyrics=self.lyrics_transcribe_unresolved_cb.isChecked(),
+            fuzzy_threshold=float(self.lyrics_threshold.value()),
+        )
 
         cfg.convert = ConvertConfig(
             enabled=self.convert_enabled_cb.isChecked(),
@@ -380,9 +453,8 @@ class MainWindow(QMainWindow):
             compute_type=None if compute == "auto" else compute,
             batch_size=self.batch_spin.value(),
             gigaam_provider=self.gigaam_provider_cb.currentText(),
+            local_files_only=self.local_files_only_cb.isChecked(),
         )
-        cfg.transcribe.local_files_only = self.local_files_only_cb.isChecked()
-        cfg.transcribe.vad_filter = self.vad_filter_cb.isChecked()
         return cfg
 
     # ---------------- handlers ----------------
@@ -425,10 +497,15 @@ class MainWindow(QMainWindow):
         if not cfg.input_dir or not Path(cfg.input_dir).is_dir():
             QMessageBox.warning(self, "Нет входной папки", "Выберите существующую входную папку.")
             return
-        if not (cfg.convert.enabled or cfg.separate.enabled or cfg.transcribe.enabled):
+        has_work = any([
+            cfg.shazam.enabled, cfg.lyrics.enabled,
+            cfg.convert.enabled, cfg.separate.enabled, cfg.transcribe.enabled,
+        ])
+        if not has_work:
             QMessageBox.warning(self, "Нет этапов", "Включите хотя бы один этап.")
             return
-        if cfg.convert.enabled and not shutil.which(cfg.convert.ffmpeg_path):
+        needs_ffmpeg = cfg.convert.enabled or cfg.shazam.enabled
+        if needs_ffmpeg and not shutil.which(cfg.convert.ffmpeg_path):
             QMessageBox.warning(self, "ffmpeg не найден",
                                 f"Команда '{cfg.convert.ffmpeg_path}' не найдена в PATH.")
             return
@@ -440,8 +517,7 @@ class MainWindow(QMainWindow):
         self.log_view.clear()
         self._log_device_info()
         if cfg.transcribe.enabled and cfg.transcribe.language is None:
-            self._append_log("⚠ Язык = auto: WhisperX определит язык на каждом файле. "
-                             "Если язык известен — задайте его явно, будет быстрее.")
+            self._append_log("⚠ Язык = auto: WhisperX определит язык на каждом файле.")
 
         self.progress.setValue(0)
         self.progress.setFormat("Запуск…")

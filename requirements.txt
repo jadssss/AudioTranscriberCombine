@@ -5,6 +5,11 @@ PySide6>=6.6
 whisperx>=3.1
 onnx-asr>=0.4
 
+# Recognition & lyrics
+shazamlite>=0.1
+mutagen>=1.47
+requests>=2.31
+
 # WhisperX pulls torch; for CUDA you must install the matching torch build, e.g.:
 #   pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121
 # For cuDNN preload helper used in main.py:
