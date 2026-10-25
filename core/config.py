@@ -81,6 +81,9 @@ class PipelineConfig:
     keep_intermediate: bool = True
     overwrite: bool = True
     mode: str = "sequential"
+    chunk_size: int = 64
+    skip_existing: bool = False     # skip files that already have text.txt
+    resume_partial: bool = True     # reuse existing vocals.wav / convert.wav
 
     convert: ConvertConfig = field(default_factory=ConvertConfig)
     separate: SeparateConfig = field(default_factory=SeparateConfig)

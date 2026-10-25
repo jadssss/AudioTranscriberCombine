@@ -27,7 +27,8 @@ AUDIO_EXTENSIONS = {
 }
 
 LogFn = Callable[[str], None]
-ProgressFn = Callable[[int, int, str], None]
+ProgressFn = Callable[[str, int, int], None]  # stage, current, total_for_stage
+OverallFn = Callable[[int, int], None]        # completed_files, total_files
 
 
 @dataclass
@@ -45,6 +46,18 @@ class Cancelled(Exception):
 
 
 # ---------------------------------------------------------------- helpers
+
+def _free_memory() -> None:
+    """Free unreferenced RAM and VRAM. Keeps model caches alive."""
+    import gc
+    gc.collect()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:  # noqa: BLE001 — never fail cleanup on a broken CUDA context
+        pass
+
 
 def collect_audio_files(input_dir: Path, recursive: bool) -> list[Path]:
     it = input_dir.rglob("*") if recursive else input_dir.iterdir()
@@ -79,8 +92,14 @@ def _build_metadata_dict(
     metadata: TrackMetadata,
     shazam: Optional[ShazamResult],
     source: Optional[str],
+    input_path: Optional[Path] = None,
 ) -> Optional[dict]:
     d: dict = {}
+    if input_path is not None:
+        try:
+            d["path"] = str(input_path.resolve())
+        except (OSError, RuntimeError):
+            d["path"] = str(input_path)
     if metadata.has_identity:
         d["tags"] = {
             "title": metadata.title,
@@ -98,6 +117,30 @@ def _build_metadata_dict(
     if source:
         d["source"] = source
     return d if d else None
+
+
+def _artifact_belongs_to(track_out: Path, input_path: Path) -> bool:
+    """Check that an output folder was created for this exact input file.
+
+    ``metadata.json`` now stores the source path. If an output folder with the
+    same stem belongs to a different file (e.g. two albums both contain
+    ``01 - Intro.mp3``), its artifacts must not be treated as "ready" for this
+    track. Legacy folders without a ``path`` key are still accepted.
+    """
+    meta_file = track_out / "metadata.json"
+    if not meta_file.is_file():
+        return True
+    try:
+        data = json.loads(meta_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return True
+    stored = data.get("path") if isinstance(data, dict) else None
+    if not stored:
+        return True
+    try:
+        return Path(str(stored)).resolve() == input_path.resolve()
+    except (OSError, RuntimeError):
+        return Path(str(stored)) == input_path
 
 
 def _write_metadata_json(path: Path, data: Optional[dict]) -> None:
@@ -151,6 +194,7 @@ class IdentifyResult:
     text: Optional[str] = None
     source: Optional[str] = None
     needs_asr: bool = True
+    lrclib_attempted: bool = False  # author/title LRCLIB search was attempted
 
 
 def _identify_file(
@@ -159,6 +203,15 @@ def _identify_file(
     config: PipelineConfig,
     log: LogFn,
 ) -> IdentifyResult:
+    """Run cheap identification steps. May populate .text and .source,
+    and set .needs_asr=False if the track is fully resolved.
+
+    Order:
+      0. embedded lyrics in file tags (USLT/LYRICS/©lyr) — cheapest, no network
+      1. Shazam fingerprint
+      2. LRCLIB identity search — exactly once:
+         Shazam result if available, otherwise artist/title from file tags
+    """
     result = IdentifyResult(metadata=read_metadata(input_path))
 
     # --- 0) embedded lyrics в самом файле ---
@@ -176,55 +229,82 @@ def _identify_file(
             result.needs_asr = False
             return result
 
-    # --- 1) LRCLIB по тегам ---
-    if config.lyrics.enabled and config.lyrics.use_tags_first and result.metadata.has_identity:
-        log("    LRCLIB по тегам...")
-        match = search_by_identity(
-            title=result.metadata.title, artist=result.metadata.artist,
-            album=result.metadata.album, duration=result.metadata.duration,
-            user_agent=config.lyrics.user_agent, timeout=config.lyrics.timeout,
-        )
-        if match:
-            result.text = match.lyrics
-            result.source = "tag+lrclib"
-            result.needs_asr = False
-            log(f"    ✓ {match.artist} — {match.title}")
-            return result
-
-    # --- 2) Shazam ---
+    # --- 1) Shazam ---
     if config.shazam.enabled:
         log("    Shazam...")
         shazam_wav = work_dir / "shazam_16k.wav"
         try:
+            work_dir.mkdir(parents=True, exist_ok=True)
             convert_to_wav(
-                input_path, shazam_wav, sample_rate=16000, channels=1,
+                input_path, shazam_wav,
+                sample_rate=16000, channels=1,
                 ffmpeg_path=config.convert.ffmpeg_path,
             )
             result.shazam = recognize(shazam_wav)
         except Exception as e:  # noqa: BLE001
             log(f"    ⚠ Shazam error: {e}")
             result.shazam = None
+        finally:
+            # 16 kHz WAV для Shazam больше не нужен — удаляем сразу,
+            # чтобы не копить десятки гигабайт в /tmp на длинных батчах.
+            try:
+                shazam_wav.unlink(missing_ok=True)
+            except OSError:
+                pass
 
         if result.shazam:
             log(f"    ✓ {result.shazam.artist} — {result.shazam.title}")
-            if config.lyrics.enabled and config.lyrics.use_shazam_result:
-                match = search_by_identity(
-                    title=result.shazam.title, artist=result.shazam.artist,
-                    album=result.shazam.album, duration=result.metadata.duration,
-                    user_agent=config.lyrics.user_agent, timeout=config.lyrics.timeout,
-                )
-                if match:
-                    result.text = match.lyrics
-                    result.source = "shazam+lrclib"
-                    result.needs_asr = False
-                    log("    ✓ текст найден через LRCLIB")
-                    return result
-            result.source = "shazam"
-            if not config.lyrics.transcribe_if_identified_no_lyrics:
-                result.needs_asr = False
-            log("    ⚠ текста нет")
         else:
             log("    ⚠ не распознан")
+
+    # --- 2) LRCLIB: ровно один поиск по автору/названию ---
+    # Приоритет — результат Shazam. Если Shazam ничего не нашёл (или его
+    # результат не используется), берём artist/title из тегов файла.
+    if config.lyrics.enabled:
+        if result.shazam and config.lyrics.use_shazam_result:
+            log("    LRCLIB по Shazam...")
+            result.lrclib_attempted = True
+            match = search_by_identity(
+                title=result.shazam.title,
+                artist=result.shazam.artist,
+                album=result.shazam.album,
+                duration=result.metadata.duration,
+                user_agent=config.lyrics.user_agent,
+                timeout=config.lyrics.timeout,
+            )
+            if match:
+                result.text = match.lyrics
+                result.source = "shazam+lrclib"
+                result.needs_asr = False
+                log(f"    ✓ {match.artist} — {match.title}")
+                return result
+            log("    ⚠ LRCLIB: не найдено")
+        elif config.lyrics.use_tags_first and result.metadata.has_identity:
+            log("    LRCLIB по тегам...")
+            result.lrclib_attempted = True
+            match = search_by_identity(
+                title=result.metadata.title,
+                artist=result.metadata.artist,
+                album=result.metadata.album,
+                duration=result.metadata.duration,
+                user_agent=config.lyrics.user_agent,
+                timeout=config.lyrics.timeout,
+            )
+            if match:
+                result.text = match.lyrics
+                result.source = "tag+lrclib"
+                result.needs_asr = False
+                log(f"    ✓ {match.artist} — {match.title}")
+                return result
+            log("    ⚠ LRCLIB: не найдено")
+
+    # --- 3) Identified, but no lyrics ---
+    if result.shazam:
+        result.source = "shazam"
+        if not config.lyrics.transcribe_if_identified_no_lyrics:
+            result.needs_asr = False
+        if not result.lrclib_attempted:
+            log("    ⚠ текста нет")
 
     return result
 
@@ -339,7 +419,7 @@ def _run_identification_parallel(
             if stop_event is not None and stop_event.is_set():
                 break
             if on_progress:
-                on_progress(i, total, "identify")
+                on_progress("identify", i, total)
             try:
                 results[f] = _identify_file(f, work_root / f.stem, config, log)
             except Exception as e:  # noqa: BLE001
@@ -374,13 +454,14 @@ def _run_identification_parallel(
                 results[f] = None
             done += 1
             if on_progress:
-                on_progress(done, total, "identify")
+                on_progress("identify", done, total)
     return results
 
 
 def _run_convert_parallel(
     config: PipelineConfig, files: list[Path], state: dict, log: LogFn,
     on_progress: Optional[ProgressFn], stop_event: Optional[threading.Event],
+    temp_registry: Optional[list[Path]] = None,
 ) -> None:
     concurrency = max(1, int(config.convert.convert_concurrency))
     total = len(files)
@@ -389,7 +470,10 @@ def _run_convert_parallel(
         if stop_event is not None and stop_event.is_set():
             return f, None, None
         try:
-            target = Path(tempfile.mkdtemp(prefix=f"at_{f.stem}_")) / "convert.wav"
+            temp_dir = Path(tempfile.mkdtemp(prefix=f"at_{f.stem}_"))
+            if temp_registry is not None:
+                temp_registry.append(temp_dir)
+            target = temp_dir / "convert.wav"
             if config.overwrite or not target.exists():
                 convert_to_wav(
                     f, target, sample_rate=config.convert.sample_rate,
@@ -405,7 +489,7 @@ def _run_convert_parallel(
             if stop_event is not None and stop_event.is_set():
                 break
             if on_progress:
-                on_progress(i, total, "convert")
+                on_progress("convert", i, total)
             f2, target, err = worker(f)
             if err:
                 state[f2]["error"] = err
@@ -429,13 +513,14 @@ def _run_convert_parallel(
                 log(f"  ✓ {f2.name}")
             done += 1
             if on_progress:
-                on_progress(done, total, "convert")
+                on_progress("convert", done, total)
 
 
 def run_pipeline(
     config: PipelineConfig, log: LogFn = print,
     on_progress: Optional[ProgressFn] = None,
     stop_event: Optional[threading.Event] = None,
+    on_overall_progress: Optional[OverallFn] = None,
 ) -> list[FileResult]:
     input_dir = Path(config.input_dir)
     if not input_dir.is_dir():
@@ -455,22 +540,39 @@ def run_pipeline(
         log("  Shazam: включён")
     if config.lyrics.enabled:
         log(f"  LRCLIB: включён (порог fuzzy={config.lyrics.fuzzy_threshold:.2f})")
+    if config.skip_existing:
+        log("  Resume: готовые файлы (text.txt) будут пропущены")
+    if config.resume_partial:
+        log("  Resume: существующие vocals.wav / convert.wav будут переиспользованы")
+    if on_overall_progress:
+        on_overall_progress(0, len(files))
     if mode == "staged":
-        return _run_staged(config, files, log, on_progress, stop_event)
-    return _run_sequential(config, files, log, on_progress, stop_event)
+        return _run_staged(
+            config, files, log, on_progress, stop_event, on_overall_progress,
+        )
+    return _run_sequential(
+        config, files, log, on_progress, stop_event, on_overall_progress,
+    )
 
 
 def _run_sequential(
     config: PipelineConfig, files: list[Path], log: LogFn,
     on_progress: Optional[ProgressFn], stop_event: Optional[threading.Event],
+    on_overall_progress: Optional[OverallFn] = None,
 ) -> list[FileResult]:
     total = len(files)
     results: list[FileResult] = []
     output_root = Path(config.output_dir)
     ident_tmp = Path(tempfile.mkdtemp(prefix="at_ident_"))
+    ident_files = files
+    if config.skip_existing:
+        ident_files = [
+            f for f in files
+            if not (output_root / f.stem / "text.txt").is_file()
+        ]
     try:
         ident_map = _run_identification_parallel(
-            config, files, log, on_progress, stop_event, ident_tmp,
+            config, ident_files, log, on_progress, stop_event, ident_tmp,
         )
     finally:
         shutil.rmtree(ident_tmp, ignore_errors=True)
@@ -480,17 +582,36 @@ def _run_sequential(
             log("⏹ Отменено")
             break
         if on_progress:
-            on_progress(idx - 1, total, "file")
+            on_progress("file", idx - 1, total)
         log(f"\n▶ [{idx}/{total}] {f.name}")
 
-        tmp_root = Path(tempfile.mkdtemp(prefix=f"at_{f.stem}_"))
         track_out = output_root / f.stem
         track_out.mkdir(parents=True, exist_ok=True)
+        belongs = _artifact_belongs_to(track_out, f)
+
+        if config.skip_existing:
+            existing_text = track_out / "text.txt"
+            if existing_text.is_file() and belongs:
+                try:
+                    existing = existing_text.read_text(encoding="utf-8")
+                except OSError:
+                    existing = None
+                log("  ⊘ text.txt уже есть — пропуск")
+                if on_progress:
+                    on_progress("file", idx, total)
+                if on_overall_progress:
+                    on_overall_progress(idx, total)
+                results.append(FileResult(f, existing, track_out, None, "existing"))
+                continue
+
+        tmp_root = Path(tempfile.mkdtemp(prefix=f"at_{f.stem}_"))
 
         text: Optional[str] = None
         source: Optional[str] = None
         error: Optional[str] = None
         metadata_dict: Optional[dict] = None
+        appended = False
+        was_cancelled = False
 
         try:
             ident = ident_map.get(f) or IdentifyResult(metadata=TrackMetadata())
@@ -498,7 +619,9 @@ def _run_sequential(
             if not ident.needs_asr:
                 text = ident.text
                 source = ident.source
-                metadata_dict = _build_metadata_dict(ident.metadata, ident.shazam, source)
+                metadata_dict = _build_metadata_dict(
+                    ident.metadata, ident.shazam, source, input_path=f,
+                )
                 if text:
                     (tmp_root / "text.txt").write_text(text, encoding="utf-8")
                 if metadata_dict:
@@ -515,10 +638,26 @@ def _run_sequential(
                 )
                 log(f"  ✓ {f.name} [{source}]")
                 results.append(FileResult(f, text, track_out, None, source, metadata_dict))
+                appended = True
                 continue
 
             audio_path: Path = f
-            if config.convert.enabled:
+            skip_convert = False
+            skip_separate = False
+            if config.resume_partial and belongs:
+                vocals = track_out / "vocals.wav"
+                convert = track_out / "convert.wav"
+                if vocals.is_file():
+                    audio_path = vocals
+                    skip_convert = True
+                    skip_separate = True
+                    log("  ↻ используем готовый vocals.wav")
+                elif convert.is_file():
+                    audio_path = convert
+                    skip_convert = True
+                    log("  ↻ используем готовый convert.wav")
+
+            if config.convert.enabled and not skip_convert:
                 _check_cancel(stop_event)
                 log("  [1] Конвертация в WAV...")
                 target = tmp_root / "convert.wav"
@@ -531,7 +670,7 @@ def _run_sequential(
                 audio_path = target
                 log("  ✓ convert.wav")
 
-            if config.separate.enabled:
+            if config.separate.enabled and not skip_separate:
                 _check_cancel(stop_event)
                 log("  [2] Отделение вокала...")
                 target = tmp_root / "vocals.wav"
@@ -562,14 +701,16 @@ def _run_sequential(
                 )
                 source = config.transcribe.engine
                 log(f"  ✓ распознано {len(text)} символов")
-                if config.lyrics.enabled and config.lyrics.try_after_asr:
+                if (config.lyrics.enabled and config.lyrics.try_after_asr):
                     matched = _try_post_asr_match(text, config, log)
                     if matched:
                         text = matched
                         source = f"{source}+lrclib"
                 (tmp_root / "text.txt").write_text(text, encoding="utf-8")
 
-            metadata_dict = _build_metadata_dict(ident.metadata, ident.shazam, source)
+            metadata_dict = _build_metadata_dict(
+                ident.metadata, ident.shazam, source, input_path=f,
+            )
             if metadata_dict:
                 _write_metadata_json(tmp_root / "metadata.json", metadata_dict)
 
@@ -586,17 +727,38 @@ def _run_sequential(
 
         except Cancelled:
             log("⏹ Отменено")
+            was_cancelled = True
             break
         except Exception as e:  # noqa: BLE001
             error = f"{type(e).__name__}: {e}"
             log(f"  ✗ Ошибка: {error}")
         finally:
+            # Even on error — preserve vocals if the user asked for it.
+            if error is not None and config.separate.save_vocals_copy:
+                vocal_src = tmp_root / "vocals.wav"
+                if vocal_src.exists():
+                    try:
+                        dst = track_out / "vocals.wav"
+                        if dst.exists():
+                            dst.unlink()
+                        shutil.move(str(vocal_src), str(dst))
+                        log(f"  ✓ {f.name} (vocals сохранён, несмотря на ошибку)")
+                    except OSError:
+                        pass
             shutil.rmtree(tmp_root, ignore_errors=True)
-            if on_progress:
-                on_progress(idx, total, "file")
-            results.append(FileResult(
-                f, text, track_out if not error else None, error, source, metadata_dict,
-            ))
+            if was_cancelled:
+                # The file was not processed to completion — do not count it
+                # in the overall bar and do not report a fake "success" row.
+                pass
+            else:
+                if not appended:
+                    results.append(FileResult(
+                        f, text, track_out if not error else None, error, source, metadata_dict,
+                    ))
+                if on_progress:
+                    on_progress("file", idx, total)
+                if on_overall_progress:
+                    on_overall_progress(idx, total)
 
     _log_summary(results, log)
     return results
@@ -605,124 +767,247 @@ def _run_sequential(
 def _run_staged(
     config: PipelineConfig, files: list[Path], log: LogFn,
     on_progress: Optional[ProgressFn], stop_event: Optional[threading.Event],
+    on_overall_progress: Optional[OverallFn] = None,
 ) -> list[FileResult]:
+    """Chunked staged mode: process `chunk_size` files, free memory, repeat."""
     output_root = Path(config.output_dir)
     total = len(files)
+    chunk_size = max(1, int(config.chunk_size or total))
 
-    state: dict[Path, dict] = {
-        f: {"audio_path": f, "ident": None, "text": None, "source": None,
-            "metadata_dict": None, "error": None, "resolved": False}
-        for f in files
-    }
+    if chunk_size >= total:
+        log(f"Один батч: {total} файлов (chunk_size={chunk_size})")
+        results = _run_staged_batch(
+            config, files, output_root, log, on_progress, stop_event,
+            overall_offset=0, overall_total=total,
+            on_overall_progress=on_overall_progress,
+            overall_counter=[0],
+        )
+        _free_memory()
+        _log_summary(results, log)
+        return results
+
+    n_batches = (total + chunk_size - 1) // chunk_size
+    log(f"Батчей: {n_batches} × {chunk_size} файлов (всего {total})")
+
+    all_results: list[FileResult] = []
+    overall_counter = [0]
+    for b in range(n_batches):
+        if stop_event is not None and stop_event.is_set():
+            log("⏹ Отменено")
+            break
+        start = b * chunk_size
+        end = min(start + chunk_size, total)
+        chunk = files[start:end]
+        log(f"\n╔═══════════════════════════════════════════════════════╗")
+        log(f"║  Батч {b+1}/{n_batches}: файлы {start+1}–{end} из {total}")
+        log(f"╚═══════════════════════════════════════════════════════╝")
+
+        try:
+            batch_results = _run_staged_batch(
+                config, chunk, output_root, log, on_progress, stop_event,
+                overall_offset=start, overall_total=total,
+                on_overall_progress=on_overall_progress,
+                overall_counter=overall_counter,
+            )
+            all_results.extend(batch_results)
+        except Exception as e:  # noqa: BLE001
+            log(f"  ✗ Батч {b+1} упал: {type(e).__name__}: {e}")
+
+        _free_memory()
+        log(f"  [batch] память очищена")
+
+    _log_summary(all_results, log)
+    return all_results
+
+
+def _run_staged_batch(
+    config: PipelineConfig,
+    batch_files: list[Path],
+    output_root: Path,
+    log: LogFn,
+    on_progress: Optional[ProgressFn],
+    stop_event: Optional[threading.Event],
+    overall_offset: int = 0,
+    overall_total: Optional[int] = None,
+    on_overall_progress: Optional[OverallFn] = None,
+    overall_counter: Optional[list[int]] = None,
+) -> list[FileResult]:
+    """One chunk of the staged pipeline. All temps are tracked and removed
+    in the `finally` block at the end of this call."""
+    if overall_total is None:
+        overall_total = len(batch_files)
+
+    if overall_counter is None:
+        overall_counter = [overall_offset]
+
+    def mark_overall(complete: bool) -> None:
+        if not complete:
+            return
+        overall_counter[0] += 1
+        if on_overall_progress:
+            on_overall_progress(
+                min(overall_counter[0], overall_total),
+                overall_total,
+            )
+
+    def is_complete(s: dict) -> bool:
+        return bool(
+            s["resolved"]
+            or s["error"] is not None
+            or s["text"] is not None
+            or not config.transcribe.enabled
+        )
+
+    def progress(stage: str, done: int, total: int) -> None:
+        """Report progress for the current stage only.
+
+        The GUI bar is reset for every stage, so the counters never have to be
+        mixed across stages (identify sees all files, transcribe only the ones
+        that actually need ASR, etc.).
+        """
+        if on_progress:
+            on_progress(stage, done, total)
+
+    temp_registry: list[Path] = []
+
+    def _mkdtemp(prefix: str) -> Path:
+        p = Path(tempfile.mkdtemp(prefix=prefix))
+        temp_registry.append(p)
+        return p
 
     def active() -> list[Path]:
-        return [f for f in files if state[f]["error"] is None and not state[f]["resolved"]]
+        return [f for f in batch_files if state[f]["error"] is None and not state[f]["resolved"]]
 
     def cancelled() -> bool:
         return stop_event is not None and stop_event.is_set()
 
-    if config.shazam.enabled or config.lyrics.enabled:
-        log(f"\n══ Этап 0 · Идентификация ({total} файлов) ══")
-        ident_tmp = Path(tempfile.mkdtemp(prefix="at_ident_"))
-        try:
-            ident_map = _run_identification_parallel(
-                config, files, log, on_progress, stop_event, ident_tmp,
+    # Seed the state from artifacts already present in output_root/<stem>.
+    # This is what makes "Resume" work: a file that already has text.txt is
+    # resolved, a file with vocals.wav skips convert+separate, and a file with
+    # only convert.wav skips just the conversion step.
+    state: dict[Path, dict] = {}
+    skipped_existing = 0
+    resumed_partial = 0
+    mismatched_folders = 0
+    for f in batch_files:
+        track_out = output_root / f.stem
+        audio_path: Path = f
+        skip_convert = False
+        skip_separate = False
+        text: Optional[str] = None
+        source: Optional[str] = None
+        resolved = False
+
+        belongs = _artifact_belongs_to(track_out, f)
+        if not belongs:
+            has_artifacts = any(
+                (track_out / name).exists()
+                for name in ("text.txt", "vocals.wav", "convert.wav")
             )
-        finally:
-            shutil.rmtree(ident_tmp, ignore_errors=True)
+            if has_artifacts:
+                mismatched_folders += 1
+                log(f"  ⚠ {f.name}: папка {track_out.name} относится к другому треку — обрабатываю заново")
 
-        for f in files:
-            ident = ident_map.get(f)
-            if ident is None:
-                state[f]["ident"] = IdentifyResult(metadata=TrackMetadata())
-                log(f"  → {f.name} (identification failed)")
-                continue
-            state[f]["ident"] = ident
-            if not ident.needs_asr:
-                state[f]["resolved"] = True
-                state[f]["text"] = ident.text
-                state[f]["source"] = ident.source
-                state[f]["metadata_dict"] = _build_metadata_dict(
-                    ident.metadata, ident.shazam, ident.source,
-                )
-                track_out = output_root / f.stem
-                track_out.mkdir(parents=True, exist_ok=True)
-                if ident.text:
-                    (track_out / "text.txt").write_text(ident.text, encoding="utf-8")
-                if state[f]["metadata_dict"]:
-                    _write_metadata_json(track_out / "metadata.json", state[f]["metadata_dict"])
-                _save_unrecognized(
-                    config, f, ident.text, ident.source,
-                    metadata=ident.metadata,
-                )
-                log(f"  ✓ {f.name} [{ident.source}]")
-            else:
-                log(f"  → {f.name} (нужен полный пайплайн)")
-
-    if config.convert.enabled and not cancelled():
-        todo = active()
-        log(f"\n══ Этап 1 · Конвертация ({len(todo)} файлов) ══")
-        _run_convert_parallel(config, todo, state, log, on_progress, stop_event)
-
-    if config.separate.enabled and not cancelled():
-        todo = active()
-        log(f"\n══ Этап 2 · Отделение вокала ({len(todo)} файлов) ══")
-        if not todo:
-            pass
-        elif len(todo) == 1:
-            f = todo[0]
-            if on_progress:
-                on_progress(1, 1, "separate")
+        text_file = track_out / "text.txt"
+        if config.skip_existing and belongs and text_file.is_file():
+            resolved = True
+            skipped_existing += 1
+            source = "existing"
             try:
-                src = state[f]["audio_path"]
-                target = src.parent / "vocals.wav"
-                with tempfile.TemporaryDirectory() as tmp:
-                    raw = separate_vocals(
-                        src, Path(tmp), model=config.separate.model,
-                        isolate_stem=config.separate.isolate_stem,
-                        unblend_path=config.separate.unblend_path,
-                        custom_kernels=config.separate.custom_kernels,
+                text = text_file.read_text(encoding="utf-8")
+            except OSError:
+                text = None
+        elif config.resume_partial and belongs:
+            vocals = track_out / "vocals.wav"
+            convert = track_out / "convert.wav"
+            if vocals.is_file():
+                audio_path = vocals
+                skip_convert = True
+                skip_separate = True
+                resumed_partial += 1
+            elif convert.is_file():
+                audio_path = convert
+                skip_convert = True
+                resumed_partial += 1
+
+        state[f] = {
+            "audio_path": audio_path, "ident": None, "text": text,
+            "source": source, "metadata_dict": None, "error": None,
+            "resolved": resolved, "skip_convert": skip_convert,
+            "skip_separate": skip_separate,
+        }
+
+    if skipped_existing:
+        log(f"  ⊘ Пропущено готовых (text.txt): {skipped_existing}")
+    if resumed_partial:
+        log(f"  ↻ Подхвачено промежуточных (vocals/convert): {resumed_partial}")
+    if mismatched_folders:
+        log(f"  ⚠ Папок с чужим path: {mismatched_folders} (пересчитаны заново)")
+    if on_overall_progress:
+        on_overall_progress(min(overall_counter[0], overall_total), overall_total)
+
+    try:
+        # --- Stage 0: identification ---
+        if config.shazam.enabled or config.lyrics.enabled:
+            to_identify = [f for f in batch_files if not state[f]["resolved"]]
+            if to_identify:
+                log(f"\n══ Этап 0 · Идентификация ({len(to_identify)} файлов) ══")
+                ident_tmp = _mkdtemp("at_ident_")
+                try:
+                    ident_map = _run_identification_parallel(
+                        config, to_identify, log, progress, stop_event, ident_tmp,
                     )
-                    shutil.move(str(raw), str(target))
-                state[f]["audio_path"] = target
-                log(f"  ✓ {f.name}")
-            except Exception as e:  # noqa: BLE001
-                state[f]["error"] = f"{type(e).__name__}: {e}"
-                log(f"  ✗ {f.name}: {e}")
-        else:
-            input_wavs = [state[f]["audio_path"] for f in todo]
-            common_root = _common_parent(input_wavs)
-            log(f"  Батч: {len(todo)} файлов, один вызов unblend")
-            if on_progress:
-                on_progress(0, len(todo), "separate")
-            try:
-                mapping = separate_vocals_batch(
-                    input_wavs, common_root,
-                    model=config.separate.model,
-                    isolate_stem=config.separate.isolate_stem,
-                    unblend_path=config.separate.unblend_path,
-                    custom_kernels=config.separate.custom_kernels,
-                    progress_callback=lambda p: on_progress(p, len(todo), "separate") if on_progress else None,
-                )
-                for f in todo:
-                    src = state[f]["audio_path"]
-                    vocal = mapping.get(src)
-                    if vocal is None:
-                        state[f]["error"] = "batch produced no output"
-                        log(f"  ✗ {f.name}: нет результата в батче")
+                finally:
+                    shutil.rmtree(ident_tmp, ignore_errors=True)
+                    try:
+                        temp_registry.remove(ident_tmp)
+                    except ValueError:
+                        pass
+
+                for f in to_identify:
+                    ident = ident_map.get(f)
+                    if ident is None:
+                        state[f]["ident"] = IdentifyResult(metadata=TrackMetadata())
+                        log(f"  → {f.name} (identification failed)")
                         continue
-                    state[f]["audio_path"] = vocal
-                    log(f"  ✓ {f.name}")
-                if on_progress:
-                    on_progress(len(todo), len(todo), "separate")
-            except Exception as e:  # noqa: BLE001
-                log(f"  ✗ Батч упал: {e}")
-                log("  ↻ Fallback: по одному...")
-                for i, f in enumerate(todo, 1):
-                    if cancelled():
-                        break
-                    if on_progress:
-                        on_progress(i, len(todo), "separate")
+                    state[f]["ident"] = ident
+                    if not ident.needs_asr:
+                        state[f]["resolved"] = True
+                        state[f]["text"] = ident.text
+                        state[f]["source"] = ident.source
+                        state[f]["metadata_dict"] = _build_metadata_dict(
+                            ident.metadata, ident.shazam, ident.source,
+                            input_path=f,
+                        )
+                        track_out = output_root / f.stem
+                        track_out.mkdir(parents=True, exist_ok=True)
+                        if ident.text:
+                            (track_out / "text.txt").write_text(ident.text, encoding="utf-8")
+                        if state[f]["metadata_dict"]:
+                            _write_metadata_json(track_out / "metadata.json", state[f]["metadata_dict"])
+                        _save_unrecognized(
+                            config, f, ident.text, ident.source,
+                            metadata=ident.metadata,
+                        )
+                        log(f"  ✓ {f.name} [{ident.source}]")
+                    else:
+                        log(f"  → {f.name} (нужен полный пайплайн)")
+
+        # --- Stage 1: convert ---
+        if config.convert.enabled and not cancelled():
+            todo = [f for f in active() if not state[f]["skip_convert"]]
+            log(f"\n══ Этап 1 · Конвертация ({len(todo)} файлов) ══")
+            progress("convert", 0, len(todo))
+            _run_convert_parallel(
+                config, todo, state, log, progress, stop_event, temp_registry,
+            )
+
+        # --- Stage 2: separate ---
+        if config.separate.enabled and not cancelled():
+            todo = [f for f in active() if not state[f]["skip_separate"]]
+            log(f"\n══ Этап 2 · Отделение вокала ({len(todo)} файлов) ══")
+            if todo:
+                def separate_single(f: Path) -> None:
                     try:
                         src = state[f]["audio_path"]
                         target = src.parent / "vocals.wav"
@@ -736,59 +1021,157 @@ def _run_staged(
                             shutil.move(str(raw), str(target))
                         state[f]["audio_path"] = target
                         log(f"  ✓ {f.name}")
-                    except Exception as inner:  # noqa: BLE001
-                        state[f]["error"] = f"{type(inner).__name__}: {inner}"
-                        log(f"  ✗ {f.name}: {inner}")
+                    except Exception as e:  # noqa: BLE001
+                        state[f]["error"] = f"{type(e).__name__}: {e}"
+                        log(f"  ✗ {f.name}: {e}")
 
-    if config.transcribe.enabled and not cancelled():
-        todo = active()
-        log(f"\n══ Этап 3 · Транскрибация ({len(todo)} файлов) ══")
-        for i, f in enumerate(todo, 1):
-            if cancelled():
-                log("⏹ Отменено")
-                break
-            try:
-                text = transcribe(
-                    state[f]["audio_path"], engine=config.transcribe.engine,
-                    model=config.transcribe.model,
-                    language=config.transcribe.language,
-                    device=config.transcribe.device,
-                    compute_type=config.transcribe.compute_type,
-                    batch_size=config.transcribe.batch_size,
-                    gigaam_provider=config.transcribe.gigaam_provider,
-                    local_files_only=config.transcribe.local_files_only,
-                )
-                state[f]["text"] = text
-                state[f]["source"] = config.transcribe.engine
-                log(f"  ✓ {f.name} ({len(text)} символов)")
-            except Exception as e:  # noqa: BLE001
-                state[f]["error"] = f"{type(e).__name__}: {e}"
-                log(f"  ✗ {f.name}: {e}")
-            finally:
-                if on_progress:
-                    on_progress(i, len(todo), "transcribe")
+                # Resumed convert.wav files already live in output_root/<stem>,
+                # while freshly converted files live in unique temp dirs.
+                # unblend's `{parent}` batch layout would mix those roots, so
+                # separate resumed files one by one and batch the rest.
+                resumed = [
+                    f for f in todo
+                    if state[f]["audio_path"].parent == output_root / f.stem
+                ]
+                resumed_set = set(resumed)
+                batchable = [f for f in todo if f not in resumed_set]
+                done = 0
+                progress("separate", 0, len(todo))
 
-    if not cancelled():
+                if len(batchable) == 1:
+                    separate_single(batchable[0])
+                    done = 1
+                    progress("separate", done, len(todo))
+                elif batchable:
+                    input_wavs = [state[f]["audio_path"] for f in batchable]
+                    common_root = _common_parent(input_wavs)
+                    log(f"  Батч: {len(batchable)} файлов, один вызов unblend")
+                    try:
+                        mapping = separate_vocals_batch(
+                            input_wavs, common_root,
+                            model=config.separate.model,
+                            isolate_stem=config.separate.isolate_stem,
+                            unblend_path=config.separate.unblend_path,
+                            custom_kernels=config.separate.custom_kernels,
+                            progress_callback=lambda p: progress(
+                                "separate", p, len(todo),
+                            ),
+                        )
+                        for f in batchable:
+                            src = state[f]["audio_path"]
+                            vocal = mapping.get(src)
+                            if vocal is None:
+                                state[f]["error"] = "batch produced no output"
+                                log(f"  ✗ {f.name}: нет результата в батче")
+                                continue
+                            state[f]["audio_path"] = vocal
+                            log(f"  ✓ {f.name}")
+                        done = len(batchable)
+                        progress("separate", done, len(todo))
+                    except Exception as e:  # noqa: BLE001
+                        log(f"  ✗ Батч упал: {e}")
+                        log("  ↻ Fallback: по одному...")
+                        for i, f in enumerate(batchable, 1):
+                            if cancelled():
+                                break
+                            progress("separate", i - 1, len(todo))
+                            separate_single(f)
+                            done = i
+                            progress("separate", i, len(todo))
+
+                for f in resumed:
+                    if cancelled():
+                        break
+                    done += 1
+                    progress("separate", done, len(todo))
+                    separate_single(f)
+            else:
+                progress("separate", 0, 0)
+
+        # --- Stage 3: transcribe ---
+        if config.transcribe.enabled and not cancelled():
+            todo = active()
+            log(f"\n══ Этап 3 · Транскрибация ({len(todo)} файлов) ══")
+            progress("transcribe", 0, len(todo))
+            for i, f in enumerate(todo, 1):
+                if cancelled():
+                    log("⏹ Отменено")
+                    break
+                try:
+                    text = transcribe(
+                        state[f]["audio_path"], engine=config.transcribe.engine,
+                        model=config.transcribe.model,
+                        language=config.transcribe.language,
+                        device=config.transcribe.device,
+                        compute_type=config.transcribe.compute_type,
+                        batch_size=config.transcribe.batch_size,
+                        gigaam_provider=config.transcribe.gigaam_provider,
+                        local_files_only=config.transcribe.local_files_only,
+                    )
+                    state[f]["text"] = text
+                    state[f]["source"] = config.transcribe.engine
+                    log(f"  ✓ {f.name} ({len(text)} символов)")
+                except Exception as e:  # noqa: BLE001
+                    state[f]["error"] = f"{type(e).__name__}: {e}"
+                    log(f"  ✗ {f.name}: {e}")
+                finally:
+                    progress("transcribe", i, len(todo))
+
+        # --- Stage 4: finalize ---
+        # NOTE: runs even if cancelled — we don't want to lose texts that
+        # were already transcribed before the user hit "Stop". Only the
+        # network call to LRCLIB (fuzzy match) is skipped when cancelled.
         log("\n══ Финализация ══")
-        for f in files:
+        for f in batch_files:
             s = state[f]
+
+            # Errored file: no text, but if separate succeeded we may still
+            # have a vocals.wav worth keeping (user asked for save_vocals_copy).
             if s["error"] is not None:
+                if config.separate.save_vocals_copy:
+                    src_audio = s["audio_path"]
+                    if isinstance(src_audio, Path):
+                        vocal = src_audio.parent / "vocals.wav"
+                        if vocal.exists():
+                            track_out = output_root / f.stem
+                            track_out.mkdir(parents=True, exist_ok=True)
+                            dst = track_out / "vocals.wav"
+                            if dst.exists():
+                                dst.unlink()
+                            try:
+                                shutil.move(str(vocal), str(dst))
+                                log(f"  ✓ {f.name} (vocals сохранён, несмотря на ошибку)")
+                            except OSError:
+                                pass
+                mark_overall(True)
                 continue
+
             if s["resolved"]:
+                mark_overall(True)
                 continue
+
             text = s["text"]
             source = s["source"]
-            if text and config.lyrics.enabled and config.lyrics.try_after_asr:
+            ident = s["ident"]
+
+            # LRCLIB fuzzy-match is the only slow/network step here —
+            # skip it on cancel, but still save the text we already have.
+            # This is a *text* search, not a duplicate author/title search.
+            if (text and config.lyrics.enabled and config.lyrics.try_after_asr
+                    and not cancelled()):
                 matched = _try_post_asr_match(text, config, log)
                 if matched:
                     text = matched
                     source = f"{source}+lrclib"
                     s["text"] = text
                     s["source"] = source
-            ident = s["ident"]
+
             metadata_dict = _build_metadata_dict(
-                ident.metadata, ident.shazam, source,
-            ) if ident else None
+                ident.metadata if ident else TrackMetadata(),
+                ident.shazam if ident else None,
+                source,
+                input_path=f,
+            )
             s["metadata_dict"] = metadata_dict
 
             track_out = output_root / f.stem
@@ -796,7 +1179,7 @@ def _run_staged(
 
             audio_work = s["audio_path"]
             if isinstance(audio_work, Path) and audio_work != f:
-                work_dir = audio_work.parent  # intermediates exist
+                work_dir = audio_work.parent
                 if text:
                     (work_dir / "text.txt").write_text(text, encoding="utf-8")
                 if metadata_dict:
@@ -808,7 +1191,6 @@ def _run_staged(
                     log=log,
                 )
             else:
-                # no intermediates (convert/separate disabled): write directly
                 if text:
                     (track_out / "text.txt").write_text(text, encoding="utf-8")
                 if metadata_dict:
@@ -819,22 +1201,26 @@ def _run_staged(
                 metadata=(ident.metadata if ident else None),
             )
             log(f"  ✓ {f.name}")
+            mark_overall(is_complete(s))
 
-    for f in files:
-        audio_path = state[f]["audio_path"]
-        if isinstance(audio_path, Path) and audio_path.parent.name.startswith(f"at_{f.stem}"):
-            shutil.rmtree(audio_path.parent, ignore_errors=True)
+    finally:
+        # Clean every temp dir created in this batch, regardless of success/error
+        for p in temp_registry:
+            try:
+                if p.exists():
+                    shutil.rmtree(p, ignore_errors=True)
+            except OSError:
+                pass
+        log(f"  [batch] удалено временных папок: {len(temp_registry)}")
 
-    results = [
+    return [
         FileResult(
             f, state[f]["text"],
             output_root / f.stem if state[f]["error"] is None else None,
             state[f]["error"], state[f]["source"], state[f]["metadata_dict"],
         )
-        for f in files
+        for f in batch_files
     ]
-    _log_summary(results, log)
-    return results
 
 
 def _log_summary(results: list[FileResult], log: LogFn) -> None:

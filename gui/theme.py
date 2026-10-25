@@ -184,6 +184,18 @@ QProgressBar::chunk {
     border-radius: 7px;
     margin: 1px;
 }
+QProgressBar#overallProgress {
+    min-height: 28px;
+    max-height: 28px;
+    font-weight: 600;
+    color: #cdd6f4;
+    border-color: #45475a;
+}
+QProgressBar#overallProgress::chunk {
+    background-color: #a6e3a1;
+    border-radius: 8px;
+    margin: 2px;
+}
 
 QScrollBar:vertical {
     background: #181825;

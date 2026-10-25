@@ -16,7 +16,8 @@ from .transcribe import transcribe_aligned
 
 
 LogFn = Callable[[str], None]
-ProgressFn = Callable[[int, int, str], None]
+ProgressFn = Callable[[str, int, int], None]  # stage, current, total
+OverallFn = Callable[[int, int], None]        # completed_files, total_files
 
 
 def _pick_audio_source(
@@ -49,6 +50,7 @@ def run_lrc_pipeline(
     log: LogFn = print,
     on_progress: Optional[ProgressFn] = None,
     stop_event: Optional[threading.Event] = None,
+    on_overall_progress: Optional[OverallFn] = None,
 ) -> list[FileResult]:
     input_dir = Path(config.input_dir)
     if not input_dir.is_dir():
@@ -67,13 +69,15 @@ def run_lrc_pipeline(
 
     results: list[FileResult] = []
     total = len(files)
+    if on_overall_progress:
+        on_overall_progress(0, total)
 
     for idx, f in enumerate(files, 1):
         if stop_event is not None and stop_event.is_set():
             log("⏹ Отменено")
             break
         if on_progress:
-            on_progress(idx - 1, total, "lrc")
+            on_progress("lrc", idx - 1, total)
         log(f"\n▶ [{idx}/{total}] {f.name}")
 
         track_out = output_dir / f.stem
@@ -127,7 +131,9 @@ def run_lrc_pipeline(
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
             if on_progress:
-                on_progress(idx, total, "lrc")
+                on_progress("lrc", idx, total)
+            if on_overall_progress:
+                on_overall_progress(idx, total)
 
     return results
 
@@ -137,6 +143,7 @@ def run_embed_pipeline(
     log: LogFn = print,
     on_progress: Optional[ProgressFn] = None,
     stop_event: Optional[threading.Event] = None,
+    on_overall_progress: Optional[OverallFn] = None,
 ) -> list[FileResult]:
     input_dir = Path(config.input_dir)
     if not input_dir.is_dir():
@@ -154,13 +161,15 @@ def run_embed_pipeline(
 
     results: list[FileResult] = []
     total = len(files)
+    if on_overall_progress:
+        on_overall_progress(0, total)
 
     for idx, f in enumerate(files, 1):
         if stop_event is not None and stop_event.is_set():
             log("⏹ Отменено")
             break
         if on_progress:
-            on_progress(idx - 1, total, "embed")
+            on_progress("embed", idx - 1, total)
 
         lrc_path = output_dir / f.stem / "text.lrc"
         error: Optional[str] = None
@@ -190,6 +199,8 @@ def run_embed_pipeline(
             results.append(FileResult(f, None, None, error, "embed"))
         finally:
             if on_progress:
-                on_progress(idx, total, "embed")
+                on_progress("embed", idx, total)
+            if on_overall_progress:
+                on_overall_progress(idx, total)
 
     return results

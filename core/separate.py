@@ -91,13 +91,10 @@ def separate_vocals_batch(
     total = len(input_wavs)
     processed = 0
     while proc.poll() is None:
+        time.sleep(2.0)
         if progress_callback and processed < total - 1:
-            if proc.wait(2.0) is not None:
-                break
             processed += 1
             progress_callback(processed)
-        else:
-            proc.wait(2.0)
 
     if proc.returncode != 0:
         raise RuntimeError(f"unblend batch failed with exit code {proc.returncode}")

@@ -101,6 +101,16 @@ class MainWindow(QMainWindow):
             self.mode_cb.addItem(label, key)
         top_layout.addRow("Режим:", self.mode_cb)
 
+        self.chunk_size_spin = QSpinBox()
+        self.chunk_size_spin.setRange(1, 10000)
+        self.chunk_size_spin.setToolTip(
+            "Размер батча в staged-режиме.\n"
+            "После каждого батча: удаляются временные файлы, освобождается VRAM.\n"
+            "Модели WhisperX остаются в памяти — перезагрузки не будет.\n"
+            "64 — разумный компромисс для 32 ГБ RAM и 8 ГБ VRAM."
+        )
+        top_layout.addRow("Размер батча:", self.chunk_size_spin)
+
         opts = QHBoxLayout()
         self.recursive_cb = QCheckBox("Рекурсивный обход")
         self.keep_intermediate_cb = QCheckBox("Сохранять промежуточные")
@@ -110,6 +120,23 @@ class MainWindow(QMainWindow):
         opts.addWidget(self.overwrite_cb)
         opts.addStretch(1)
         top_layout.addRow("Опции:", opts)
+
+        resume_opts = QHBoxLayout()
+        self.skip_existing_cb = QCheckBox("Пропускать готовые (text.txt)")
+        self.skip_existing_cb.setToolTip(
+            "Не трогать файлы, у которых в <output>/<stem>/ уже есть text.txt.\n"
+            "Позволяет продолжить большой прогон после сбоя без пересчёта.\n"
+            "Если в metadata.json записан path другого файла — папка не считается готовой."
+        )
+        self.resume_partial_cb = QCheckBox("Подхватывать vocals.wav / convert.wav")
+        self.resume_partial_cb.setToolTip(
+            "Если text.txt ещё нет, но есть vocals.wav — сразу переходить к\n"
+            "транскрибации. Если есть только convert.wav — пропустить конвертацию."
+        )
+        resume_opts.addWidget(self.skip_existing_cb)
+        resume_opts.addWidget(self.resume_partial_cb)
+        resume_opts.addStretch(1)
+        top_layout.addRow("Resume:", resume_opts)
         root.addWidget(top_box)
 
         self.tabs = QTabWidget()
@@ -155,6 +182,11 @@ class MainWindow(QMainWindow):
         self.progress = QProgressBar()
         self.progress.setFormat("Ожидание")
         root.addWidget(self.progress)
+
+        self.overall_progress = QProgressBar()
+        self.overall_progress.setObjectName("overallProgress")
+        self.overall_progress.setFormat("Общий прогресс: ожидание")
+        root.addWidget(self.overall_progress)
 
         self.log_view = QPlainTextEdit()
         self.log_view.setObjectName("log")
@@ -209,8 +241,17 @@ class MainWindow(QMainWindow):
         self.lyrics_user_agent = QLineEdit()
         form.addRow("User-Agent:", self.lyrics_user_agent)
         self.lyrics_use_tags_cb = QCheckBox("Искать по тегам")
+        self.lyrics_use_tags_cb.setToolTip(
+            "Использовать artist/title из тегов файла для поиска на LRCLIB.\n"
+            "Срабатывает как fallback, если Shazam ничего не нашёл\n"
+            "или его результат отключён."
+        )
         form.addRow("", self.lyrics_use_tags_cb)
         self.lyrics_use_shazam_cb = QCheckBox("Искать по Shazam")
+        self.lyrics_use_shazam_cb.setToolTip(
+            "Приоритетный источник для поиска на LRCLIB: artist/title из Shazam.\n"
+            "Теги файла используются только если Shazam не дал результата."
+        )
         form.addRow("", self.lyrics_use_shazam_cb)
         self.lyrics_after_asr_cb = QCheckBox("Проверять после ASR (fuzzy)")
         form.addRow("", self.lyrics_after_asr_cb)
@@ -410,6 +451,8 @@ class MainWindow(QMainWindow):
         self.recursive_cb.setChecked(cfg.recursive)
         self.keep_intermediate_cb.setChecked(cfg.keep_intermediate)
         self.overwrite_cb.setChecked(cfg.overwrite)
+        self.skip_existing_cb.setChecked(cfg.skip_existing)
+        self.resume_partial_cb.setChecked(cfg.resume_partial)
         i = self.mode_cb.findData(cfg.mode)
         if i >= 0:
             self.mode_cb.setCurrentIndex(i)
@@ -460,6 +503,7 @@ class MainWindow(QMainWindow):
         self.lrc_align_model_edit.setText(cfg.lrc.align_model or "")
         self.lrc_device_cb.setCurrentText(cfg.lrc.device)
         self.lrc_embed_in_place_cb.setChecked(cfg.lrc.embed_in_place)
+        self.chunk_size_spin.setValue(cfg.chunk_size)
 
     def _collect_config(self) -> PipelineConfig:
         cfg = PipelineConfig()
@@ -468,6 +512,8 @@ class MainWindow(QMainWindow):
         cfg.recursive = self.recursive_cb.isChecked()
         cfg.keep_intermediate = self.keep_intermediate_cb.isChecked()
         cfg.overwrite = self.overwrite_cb.isChecked()
+        cfg.skip_existing = self.skip_existing_cb.isChecked()
+        cfg.resume_partial = self.resume_partial_cb.isChecked()
         cfg.mode = self.mode_cb.currentData()
 
         cfg.shazam = ShazamConfig(
@@ -522,6 +568,7 @@ class MainWindow(QMainWindow):
             audio_source=self.lrc_audio_source_cb.currentText(),
             embed_in_place=self.lrc_embed_in_place_cb.isChecked(),
         )
+        cfg.chunk_size = self.chunk_size_spin.value()
         return cfg
 
     # ---------------- handlers ----------------
@@ -600,11 +647,15 @@ class MainWindow(QMainWindow):
         self._log_device_info()
         self.progress.setValue(0)
         self.progress.setFormat("Запуск…")
+        self.overall_progress.setMaximum(1)
+        self.overall_progress.setValue(0)
+        self.overall_progress.setFormat("Общий прогресс: запуск…")
         self._set_busy(True)
 
         self._worker = PipelineWorker(cfg, task=task)
         self._worker.log.connect(self._append_log)
         self._worker.progress.connect(self._on_progress)
+        self._worker.overall_progress.connect(self._on_overall_progress)
         self._worker.finished_ok.connect(self._on_finished)
         self._worker.failed.connect(self._on_failed)
         self._worker.start()
@@ -619,21 +670,61 @@ class MainWindow(QMainWindow):
         sb = self.log_view.verticalScrollBar()
         sb.setValue(sb.maximum())
 
-    def _on_progress(self, done: int, total: int, stage: str) -> None:
-        self.progress.setMaximum(total)
-        self.progress.setValue(done)
+    def _on_progress(self, stage: str, done: int, total: int) -> None:
         label = STAGE_LABELS.get(stage, stage)
-        self.progress.setFormat(f"{label} — %v / %m")
+        if total > 0:
+            self.progress.setMaximum(total)
+            self.progress.setValue(min(done, total))
+            self.progress.setFormat(f"{label}: %v / %m")
+        else:
+            # Nothing to do for this stage — still show which stage we are on
+            # instead of leaving the previous stage's label frozen.
+            self.progress.setMaximum(1)
+            self.progress.setValue(0)
+            self.progress.setFormat(f"{label}: 0 / 0")
+
+    def _on_overall_progress(self, done: int, total: int) -> None:
+        """Overall job progress: completed files / all files in the run."""
+        if total <= 0:
+            self.overall_progress.setMaximum(1)
+            self.overall_progress.setValue(0)
+            self.overall_progress.setFormat("Общий прогресс: 0 / 0")
+            return
+
+        done = max(0, min(done, total))
+        remaining = total - done
+        percent = int(done * 100 / total)
+        self.overall_progress.setMaximum(total)
+        self.overall_progress.setValue(done)
+        self.overall_progress.setFormat(
+            f"Общий прогресс: {done} / {total} ({percent}%) · осталось {remaining}"
+        )
 
     def _on_finished(self, results: list) -> None:
         self._set_busy(False)
         ok = sum(1 for r in results if r.error is None)
         fail = len(results) - ok
         self.progress.setFormat(f"Готово — успешно {ok}, с ошибкой {fail}")
+        total = self.overall_progress.maximum()
+        done = self.overall_progress.value()
+        if total > 0 and done >= total:
+            self.overall_progress.setFormat(
+                f"Общий прогресс: {done} / {total} — завершено"
+            )
+        elif total > 0:
+            remaining = total - done
+            self.overall_progress.setFormat(
+                f"Общий прогресс: {done} / {total} — остановлено, осталось {remaining}"
+            )
         self._append_log(f"\n✅ Готово. Успешно: {ok}, с ошибкой: {fail}.")
 
     def _on_failed(self, message: str) -> None:
         self._set_busy(False)
         self.progress.setFormat("Ошибка")
+        if self.overall_progress.maximum() > 0:
+            self.overall_progress.setFormat(
+                f"Общий прогресс: {self.overall_progress.value()} / "
+                f"{self.overall_progress.maximum()} — ошибка"
+            )
         self._append_log(f"\n✗ Ошибка пайплайна: {message}")
         QMessageBox.critical(self, "Ошибка", message)

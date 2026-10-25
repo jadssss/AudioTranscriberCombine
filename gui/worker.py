@@ -10,7 +10,8 @@ from core.config import PipelineConfig
 
 class PipelineWorker(QThread):
     log = Signal(str)
-    progress = Signal(int, int, str)   # done, total, stage
+    progress = Signal(str, int, int)   # stage, current, total_for_stage
+    overall_progress = Signal(int, int)  # completed_files, total_files
     finished_ok = Signal(list)
     failed = Signal(str)
 
@@ -35,8 +36,9 @@ class PipelineWorker(QThread):
             results = runner(
                 self._config,
                 log=self.log.emit,
-                on_progress=lambda d, t, s: self.progress.emit(d, t, s),
+                on_progress=lambda s, d, t: self.progress.emit(s, d, t),
                 stop_event=self._stop_event,
+                on_overall_progress=lambda d, t: self.overall_progress.emit(d, t),
             )
             self.finished_ok.emit(results)
         except Exception as exc:  # noqa: BLE001

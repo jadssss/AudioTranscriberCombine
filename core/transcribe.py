@@ -11,6 +11,31 @@ from pathlib import Path
 from typing import Optional
 
 
+# Set permanently once the CUDA context has died (e.g. after an unrecoverable
+# OOM). Every later CUDA transcription fails instantly instead of re-loading
+# the model forever and hanging the pipeline.
+_CUDA_BROKEN = False
+
+
+def _is_cuda_error(exc: BaseException) -> bool:
+    err = str(exc).lower()
+    return (
+        "out of memory" in err
+        or "cuda" in err
+        or "device ordinal" in err
+        or "cublas" in err
+        or "cudnn" in err
+    )
+
+
+def _check_cuda_usable(device: str) -> None:
+    if device == "cuda" and _CUDA_BROKEN:
+        raise RuntimeError(
+            "CUDA context is broken (previous OOM was unrecoverable). "
+            "Restart the app or switch device to CPU."
+        )
+
+
 def _resolve_device(device: str) -> str:
     if device in ("cuda", "cpu"):
         return device
@@ -39,7 +64,7 @@ def _free_vram() -> None:
         import torch
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-    except ImportError:
+    except Exception:  # noqa: BLE001 — cleanup must never mask the original error
         pass
 
 
@@ -124,7 +149,9 @@ def transcribe(
     local_files_only: bool = False,
     vad_filter: bool = True,
 ) -> str:
+    global _CUDA_BROKEN
     device = _resolve_device(device)
+    _check_cuda_usable(device)
 
     if engine == "whisperx":
         try:
@@ -133,16 +160,26 @@ def transcribe(
                 batch_size, local_files_only, vad_filter,
             )
         except Exception as e:
-            err = str(e).lower()
-            if "out of memory" in err or "cuda" in err or "device ordinal" in err:
-                print(f"  [ASR] CUDA error: {e}. Clearing model cache and retrying...")
-                _WhisperXModels._cache.clear()
-                _free_vram()
+            if not _is_cuda_error(e):
+                raise
+            print(f"  [ASR] CUDA error: {e}. Clearing model cache and retrying...")
+            _WhisperXModels._cache.clear()
+            _free_vram()
+            try:
                 return _transcribe_whisperx(
                     audio_path, model, language, device, compute_type,
                     batch_size, local_files_only, vad_filter,
                 )
-            raise
+            except Exception as retry_error:
+                if not _is_cuda_error(retry_error):
+                    raise
+                _CUDA_BROKEN = True
+                print("  [ASR] CUDA context is unrecoverable — "
+                      "GPU disabled for the rest of this run.")
+                raise RuntimeError(
+                    "CUDA context is broken after OOM recovery failed. "
+                    "Restart the app or switch device to CPU."
+                ) from retry_error
 
     if engine == "gigaam":
         return _transcribe_gigaam(audio_path, gigaam_provider)
@@ -191,6 +228,7 @@ def transcribe_aligned(
     """
     import whisperx
     device = _resolve_device(device)
+    _check_cuda_usable(device)
     model_obj = _WhisperXModels.get(model, device, compute_type, local_files_only)
     audio = whisperx.load_audio(str(audio_path))
     result = model_obj.transcribe(audio, batch_size=batch_size, language=language)
