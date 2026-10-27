@@ -692,6 +692,14 @@ class MainWindow(QMainWindow):
                                     f"Команда '{cfg.separate.unblend_path}' не найдена в PATH.")
                 return
 
+        if task == "lrc" and not shutil.which(cfg.convert.ffmpeg_path):
+            QMessageBox.warning(
+                self, "ffmpeg не найден",
+                f"'{cfg.convert.ffmpeg_path}' не найден в PATH.\n"
+                "LRC-этапу нужен ffmpeg для подготовки аудио."
+            )
+            return
+
         if task == "lrc" and cfg.transcribe.engine != "whisperx":
             QMessageBox.warning(
                 self, "LRC требует WhisperX",

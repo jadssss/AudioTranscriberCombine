@@ -18,7 +18,7 @@ from .lyrics import LyricsMatch, search_by_identity, search_by_text
 from .metadata import TrackMetadata, read_metadata
 from .recognize import ShazamResult, recognize
 from .separate import separate_vocals, separate_vocals_batch
-from .transcribe import transcribe
+from .transcribe import CudaOOMError, transcribe
 from .lrc import is_lrc, read_embedded_lyrics
 
 
@@ -729,6 +729,10 @@ def _run_sequential(
             log("⏹ Отменено")
             was_cancelled = True
             break
+        except CudaOOMError as e:
+            error = f"CudaOOMError: {e}"
+            source = "oom_skipped"
+            log(f"  ⊘ {f.name}: OOM после 3 попыток — пропущен, идём дальше")
         except Exception as e:  # noqa: BLE001
             error = f"{type(e).__name__}: {e}"
             log(f"  ✗ Ошибка: {error}")
@@ -1010,7 +1014,22 @@ def _run_staged_batch(
                 def separate_single(f: Path) -> None:
                     try:
                         src = state[f]["audio_path"]
-                        target = src.parent / "vocals.wav"
+                        # Never write next to the original input: with
+                        # convert.enabled=False src == f, so every track would
+                        # overwrite input_dir/vocals.wav. Only reuse the track
+                        # output folder when the source already lives there.
+                        track_dir = output_root / f.stem
+                        if src.parent == track_dir:
+                            # Already in the persistent track folder (resume).
+                            target = src.parent / "vocals.wav"
+                        elif src.parent == f.parent:
+                            # src is the original input file (convert disabled).
+                            # Never write next to it: all tracks share input_dir
+                            # and would overwrite input_dir/vocals.wav.
+                            target = _mkdtemp("at_sep_") / "vocals.wav"
+                        else:
+                            # Freshly converted file in its own unique temp dir.
+                            target = src.parent / "vocals.wav"
                         with tempfile.TemporaryDirectory() as tmp:
                             raw = separate_vocals(
                                 src, Path(tmp), model=config.separate.model,
@@ -1027,11 +1046,15 @@ def _run_staged_batch(
 
                 # Resumed convert.wav files already live in output_root/<stem>,
                 # while freshly converted files live in unique temp dirs.
+                # Original inputs (convert disabled) must also go through the
+                # one-by-one path: batching them shares input_dir and can
+                # collide on vocals.wav.
                 # unblend's `{parent}` batch layout would mix those roots, so
-                # separate resumed files one by one and batch the rest.
+                # separate resumed/original files one by one and batch the rest.
                 resumed = [
                     f for f in todo
                     if state[f]["audio_path"].parent == output_root / f.stem
+                    or state[f]["audio_path"].parent == f.parent
                 ]
                 resumed_set = set(resumed)
                 batchable = [f for f in todo if f not in resumed_set]
@@ -1111,6 +1134,10 @@ def _run_staged_batch(
                     state[f]["text"] = text
                     state[f]["source"] = config.transcribe.engine
                     log(f"  ✓ {f.name} ({len(text)} символов)")
+                except CudaOOMError as e:
+                    state[f]["error"] = f"CudaOOMError: {e}"
+                    state[f]["source"] = "oom_skipped"
+                    log(f"  ⊘ {f.name}: OOM — пропущен")
                 except Exception as e:  # noqa: BLE001
                     state[f]["error"] = f"{type(e).__name__}: {e}"
                     log(f"  ✗ {f.name}: {e}")

@@ -14,7 +14,7 @@ from .metadata import read_metadata
 from .pipeline import (
     FileResult, _artifact_belongs_to, _save_unrecognized, collect_audio_files,
 )
-from .transcribe import transcribe_aligned
+from .transcribe import CudaOOMError, transcribe_aligned
 
 
 LogFn = Callable[[str], None]
@@ -155,6 +155,10 @@ def run_lrc_pipeline(
                 metadata=read_metadata(f),
             )
             results.append(FileResult(f, None, track_out, None, "lrc"))
+        except CudaOOMError as e:
+            error = f"CudaOOMError: {e}"
+            log(f"  ⊘ {f.name}: OOM — пропущен, идём дальше")
+            results.append(FileResult(f, None, None, error, "lrc+oom"))
         except Exception as e:  # noqa: BLE001
             error = f"{type(e).__name__}: {e}"
             log(f"  ✗ Ошибка: {error}")

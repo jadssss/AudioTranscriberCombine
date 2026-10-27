@@ -11,10 +11,8 @@ from pathlib import Path
 from typing import Optional
 
 
-# Set permanently once the CUDA context has died (e.g. after an unrecoverable
-# OOM). Every later CUDA transcription fails instantly instead of re-loading
-# the model forever and hanging the pipeline.
-_CUDA_BROKEN = False
+class CudaOOMError(RuntimeError):
+    """CUDA OOM, переживший все стратегии понижения нагрузки."""
 
 
 def _is_cuda_error(exc: BaseException) -> bool:
@@ -26,14 +24,6 @@ def _is_cuda_error(exc: BaseException) -> bool:
         or "cublas" in err
         or "cudnn" in err
     )
-
-
-def _check_cuda_usable(device: str) -> None:
-    if device == "cuda" and _CUDA_BROKEN:
-        raise RuntimeError(
-            "CUDA context is broken (previous OOM was unrecoverable). "
-            "Restart the app or switch device to CPU."
-        )
 
 
 def _resolve_device(device: str) -> str:
@@ -66,6 +56,36 @@ def _free_vram() -> None:
             torch.cuda.empty_cache()
     except Exception:  # noqa: BLE001 — cleanup must never mask the original error
         pass
+
+
+def _model_transcribe_with_retry(
+    model_obj, audio, language, batch_size, vad_filter, name="<audio>",
+):
+    """Try progressively lighter settings so one long file can still finish.
+
+    The loaded model is intentionally kept in the cache between attempts:
+    reloading it costs minutes and does not help with an OOM caused by a long
+    audio file. If even batch=1 without VAD fails, raise CudaOOMError so the
+    caller can skip this file and continue with the rest of the batch.
+    """
+    attempts = [
+        (batch_size, vad_filter),   # as configured
+        (1, False),                 # minimum memory: no Pyannote VAD, batch=1
+        (1, False),                 # one more time after empty_cache()
+    ]
+    last: Optional[Exception] = None
+    for i, (bs, vad) in enumerate(attempts, 1):
+        try:
+            return model_obj.transcribe(
+                audio, batch_size=bs, language=language, vad_filter=vad,
+            )
+        except Exception as e:  # noqa: BLE001
+            if not _is_cuda_error(e):
+                raise
+            last = e
+            print(f"  [ASR] OOM on {name} (attempt {i}/3, bs={bs}, vad={vad}): {e}")
+            _free_vram()
+    raise CudaOOMError(f"OOM after 3 attempts on {name}: {last}") from last
 
 
 class _WhisperXModels:
@@ -149,37 +169,13 @@ def transcribe(
     local_files_only: bool = False,
     vad_filter: bool = True,
 ) -> str:
-    global _CUDA_BROKEN
     device = _resolve_device(device)
-    _check_cuda_usable(device)
 
     if engine == "whisperx":
-        try:
-            return _transcribe_whisperx(
-                audio_path, model, language, device, compute_type,
-                batch_size, local_files_only, vad_filter,
-            )
-        except Exception as e:
-            if not _is_cuda_error(e):
-                raise
-            print(f"  [ASR] CUDA error: {e}. Clearing model cache and retrying...")
-            _WhisperXModels._cache.clear()
-            _free_vram()
-            try:
-                return _transcribe_whisperx(
-                    audio_path, model, language, device, compute_type,
-                    batch_size, local_files_only, vad_filter,
-                )
-            except Exception as retry_error:
-                if not _is_cuda_error(retry_error):
-                    raise
-                _CUDA_BROKEN = True
-                print("  [ASR] CUDA context is unrecoverable — "
-                      "GPU disabled for the rest of this run.")
-                raise RuntimeError(
-                    "CUDA context is broken after OOM recovery failed. "
-                    "Restart the app or switch device to CPU."
-                ) from retry_error
+        return _transcribe_whisperx(
+            audio_path, model, language, device, compute_type,
+            batch_size, local_files_only, vad_filter,
+        )
 
     if engine == "gigaam":
         return _transcribe_gigaam(audio_path, gigaam_provider)
@@ -199,7 +195,9 @@ def _transcribe_whisperx(
     import whisperx
     model = _WhisperXModels.get(model_name, device, compute_type, local_files_only)
     audio = whisperx.load_audio(str(audio_path))
-    result = model.transcribe(audio, batch_size=batch_size, language=language)
+    result = _model_transcribe_with_retry(
+        model, audio, language, batch_size, vad_filter, name=audio_path.name,
+    )
     text = " ".join(seg["text"].strip() for seg in result["segments"]).strip()
     del audio, result
     _free_vram()
@@ -220,6 +218,7 @@ def transcribe_aligned(
     batch_size: int = 8,
     align_model: Optional[str] = None,
     local_files_only: bool = False,
+    vad_filter: bool = True,
 ) -> tuple[list[dict], str]:
     """Transcribe + word-level align. Returns (aligned_segments, detected_language).
 
@@ -228,10 +227,11 @@ def transcribe_aligned(
     """
     import whisperx
     device = _resolve_device(device)
-    _check_cuda_usable(device)
     model_obj = _WhisperXModels.get(model, device, compute_type, local_files_only)
     audio = whisperx.load_audio(str(audio_path))
-    result = model_obj.transcribe(audio, batch_size=batch_size, language=language)
+    result = _model_transcribe_with_retry(
+        model_obj, audio, language, batch_size, vad_filter, name=audio_path.name,
+    )
 
     detected = result.get("language") or language or "en"
 
