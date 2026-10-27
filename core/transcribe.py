@@ -58,6 +58,21 @@ def _free_vram() -> None:
         pass
 
 
+def _enable_tf32() -> None:
+    """Enable TF32 matmul on Ampere+ GPUs (RTX 30/40).
+
+    Called lazily right before a WhisperX model is loaded, so runs that do not
+    use ASR never import Torch or create a CUDA context at startup.
+    """
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+    except Exception:  # noqa: BLE001 — purely an optimization
+        pass
+
+
 def _model_transcribe_with_retry(
     model_obj, audio, language, batch_size, vad_filter, name="<audio>",
 ):
@@ -98,6 +113,8 @@ class _WhisperXModels:
             compute_type = "int8_float16" if device == "cuda" else "int8"
         key = (model_name, device, compute_type, local_files_only)
         if key not in cls._cache:
+            if device == "cuda":
+                _enable_tf32()
             import whisperx
             print(f"  [ASR] loading WhisperX {model_name} on {device} "
                   f"({compute_type}, local_files_only={local_files_only})...")

@@ -4,6 +4,7 @@ from __future__ import annotations
 import difflib
 import json
 import shutil
+import sys
 import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -48,11 +49,18 @@ class Cancelled(Exception):
 # ---------------------------------------------------------------- helpers
 
 def _free_memory() -> None:
-    """Free unreferenced RAM and VRAM. Keeps model caches alive."""
+    """Free unreferenced RAM and VRAM. Keeps model caches alive.
+
+    Never import torch here: if the current run does not use ASR, importing it
+    would initialize a CUDA context and steal VRAM from separation. If torch is
+    already loaded by the ASR stage, we can safely empty its cache.
+    """
     import gc
     gc.collect()
+    torch = sys.modules.get("torch")
+    if torch is None:
+        return
     try:
-        import torch
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
     except Exception:  # noqa: BLE001 — never fail cleanup on a broken CUDA context
@@ -148,6 +156,53 @@ def _write_metadata_json(path: Path, data: Optional[dict]) -> None:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def _existing_artifacts(
+    output_root: Path, input_path: Path,
+) -> tuple[bool, bool, bool]:
+    """Return (has_text, has_vocals, has_convert) for the matching output folder.
+
+    Artifacts are ignored when ``metadata.json`` says the folder belongs to a
+    different input file with the same stem.
+    """
+    track_out = output_root / input_path.stem
+    if not _artifact_belongs_to(track_out, input_path):
+        return False, False, False
+    return (
+        (track_out / "text.txt").is_file(),
+        (track_out / "vocals.wav").is_file(),
+        (track_out / "convert.wav").is_file(),
+    )
+
+
+def _needs_work(config: PipelineConfig, output_root: Path, f: Path) -> bool:
+    """True if at least one enabled stage still has to do something for ``f``.
+
+    This mirrors the resume rules used by the staged/sequential pipelines:
+      * text.txt + skip_existing        -> resolved, nothing to do
+      * vocals.wav + resume_partial     -> convert/separate are skipped
+      * convert.wav + resume_partial    -> convert is skipped
+    Files with no pending work are filtered out before batching, so batches
+    stay full instead of being filled by already-finished tracks.
+    """
+    has_text, has_vocals, has_convert = _existing_artifacts(output_root, f)
+
+    if config.skip_existing and has_text:
+        return False  # resolved by the same rule the pipelines use
+
+    vocals_ready = config.resume_partial and has_vocals
+    convert_ready = config.resume_partial and (has_vocals or has_convert)
+
+    if config.shazam.enabled or config.lyrics.enabled:
+        return True  # identification still has to run (no resolved text)
+    if config.convert.enabled and not convert_ready:
+        return True
+    if config.separate.enabled and not vocals_ready:
+        return True
+    if config.transcribe.enabled:
+        return True  # text is missing or skip_existing is disabled
+    return False
 
 
 def _save_unrecognized(
@@ -532,7 +587,8 @@ def run_pipeline(
         log("Аудиофайлы не найдены.")
         return []
     mode = (config.mode or "sequential").lower()
-    log(f"Найдено треков: {len(files)}   |   режим: {mode}   |   "
+    total_all = len(files)
+    log(f"Найдено треков: {total_all}   |   режим: {mode}   |   "
         f"keep_intermediate={config.keep_intermediate}")
     if config.separate.save_vocals_copy:
         log("  ✓ Вокал будет сохраняться всегда (save_vocals_copy=True)")
@@ -544,14 +600,32 @@ def run_pipeline(
         log("  Resume: готовые файлы (text.txt) будут пропущены")
     if config.resume_partial:
         log("  Resume: существующие vocals.wav / convert.wav будут переиспользованы")
+
+    # Pre-scan before chunking: remove files that are already complete for the
+    # current set of enabled stages. Without this, skipped tracks consumed
+    # batch slots and a staged run produced many half-empty batches.
+    pending = [f for f in files if _needs_work(config, output_dir, f)]
+    already_done = total_all - len(pending)
+    if already_done:
+        log(f"  ✓ Уже готово: {already_done} — в батчи не попадут")
+        log(f"  → К обработке: {len(pending)}")
+    files = pending
+    if not files:
+        log("  Все файлы уже готовы — работа не требуется.")
+        if on_overall_progress:
+            on_overall_progress(total_all, total_all)
+        return []
+
     if on_overall_progress:
-        on_overall_progress(0, len(files))
+        on_overall_progress(already_done, total_all)
     if mode == "staged":
         return _run_staged(
             config, files, log, on_progress, stop_event, on_overall_progress,
+            overall_base=already_done, overall_total=total_all,
         )
     return _run_sequential(
         config, files, log, on_progress, stop_event, on_overall_progress,
+        overall_base=already_done, overall_total=total_all,
     )
 
 
@@ -559,8 +633,12 @@ def _run_sequential(
     config: PipelineConfig, files: list[Path], log: LogFn,
     on_progress: Optional[ProgressFn], stop_event: Optional[threading.Event],
     on_overall_progress: Optional[OverallFn] = None,
+    overall_base: int = 0,
+    overall_total: Optional[int] = None,
 ) -> list[FileResult]:
     total = len(files)
+    if overall_total is None:
+        overall_total = total
     results: list[FileResult] = []
     output_root = Path(config.output_dir)
     ident_tmp = Path(tempfile.mkdtemp(prefix="at_ident_"))
@@ -600,7 +678,9 @@ def _run_sequential(
                 if on_progress:
                     on_progress("file", idx, total)
                 if on_overall_progress:
-                    on_overall_progress(idx, total)
+                    on_overall_progress(
+                        min(overall_base + idx, overall_total), overall_total,
+                    )
                 results.append(FileResult(f, existing, track_out, None, "existing"))
                 continue
 
@@ -762,7 +842,9 @@ def _run_sequential(
                 if on_progress:
                     on_progress("file", idx, total)
                 if on_overall_progress:
-                    on_overall_progress(idx, total)
+                    on_overall_progress(
+                        min(overall_base + idx, overall_total), overall_total,
+                    )
 
     _log_summary(results, log)
     return results
@@ -772,19 +854,23 @@ def _run_staged(
     config: PipelineConfig, files: list[Path], log: LogFn,
     on_progress: Optional[ProgressFn], stop_event: Optional[threading.Event],
     on_overall_progress: Optional[OverallFn] = None,
+    overall_base: int = 0,
+    overall_total: Optional[int] = None,
 ) -> list[FileResult]:
     """Chunked staged mode: process `chunk_size` files, free memory, repeat."""
     output_root = Path(config.output_dir)
     total = len(files)
+    if overall_total is None:
+        overall_total = overall_base + total
     chunk_size = max(1, int(config.chunk_size or total))
 
     if chunk_size >= total:
         log(f"Один батч: {total} файлов (chunk_size={chunk_size})")
         results = _run_staged_batch(
             config, files, output_root, log, on_progress, stop_event,
-            overall_offset=0, overall_total=total,
+            overall_offset=overall_base, overall_total=overall_total,
             on_overall_progress=on_overall_progress,
-            overall_counter=[0],
+            overall_counter=[overall_base],
         )
         _free_memory()
         _log_summary(results, log)
@@ -794,7 +880,7 @@ def _run_staged(
     log(f"Батчей: {n_batches} × {chunk_size} файлов (всего {total})")
 
     all_results: list[FileResult] = []
-    overall_counter = [0]
+    overall_counter = [overall_base]
     for b in range(n_batches):
         if stop_event is not None and stop_event.is_set():
             log("⏹ Отменено")
@@ -809,7 +895,7 @@ def _run_staged(
         try:
             batch_results = _run_staged_batch(
                 config, chunk, output_root, log, on_progress, stop_event,
-                overall_offset=start, overall_total=total,
+                overall_offset=overall_base + start, overall_total=overall_total,
                 on_overall_progress=on_overall_progress,
                 overall_counter=overall_counter,
             )

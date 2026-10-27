@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import shutil
+import subprocess
 from pathlib import Path
 from typing import Optional
 
@@ -42,17 +43,30 @@ MODE_LABELS = {
 
 
 def _detect_device_info() -> tuple[str, str]:
+    """Report the GPU via nvidia-smi.
+
+    Torch must not be imported here: importing it initializes a CUDA context
+    and reserves VRAM even for runs that only need separation. The ASR stage
+    imports Torch lazily when it actually loads a model.
+    """
     try:
-        import torch
-    except ImportError:
-        return "⚠ PyTorch не установлен", "#f38ba8"
-    if torch.cuda.is_available():
-        try:
-            name = torch.cuda.get_device_name(0)
-            vram = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
-            return f"✓ CUDA: {name} · {vram:.1f} GB VRAM", "#a6e3a1"
-        except Exception:  # noqa: BLE001
-            return "✓ CUDA доступна", "#a6e3a1"
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name,memory.total",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5, check=True,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        out = ""
+    if out:
+        parts = [p.strip() for p in out.splitlines()[0].split(",")]
+        name = parts[0] or "CUDA GPU"
+        if len(parts) > 1:
+            try:
+                vram = float(parts[1]) / 1024  # MiB -> GiB
+                return f"✓ CUDA: {name} · {vram:.1f} GB VRAM", "#a6e3a1"
+            except ValueError:
+                pass
+        return f"✓ CUDA: {name}", "#a6e3a1"
     return "⚠ CUDA не обнаружена — расчёт пойдёт на CPU (медленно)", "#f9e2af"
 
 

@@ -26,20 +26,8 @@ def preload_cudnn() -> None:
                 pass
 
 
-def enable_tf32() -> None:
-    """Enable TF32 for faster matmul on Ampere+ GPUs (RTX 30/40 series)."""
-    try:
-        import torch
-        if torch.cuda.is_available():
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
-    except ImportError:
-        pass
-
-
 def main() -> int:
     preload_cudnn()
-    enable_tf32()
 
     from PySide6.QtWidgets import QApplication
     from gui.theme import DARK_STYLESHEET
