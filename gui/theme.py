@@ -170,29 +170,29 @@ QCheckBox::indicator:checked {
 }
 
 QProgressBar {
-    background-color: #181825;
-    border: 1px solid #313244;
+    background-color: #0b0b12;
+    border: 1px solid #7f849c;
     border-radius: 8px;
     text-align: center;
-    color: #cdd6f4;
-    min-height: 24px;
-    max-height: 24px;
-    font-weight: 500;
+    color: #ffffff;
+    min-height: 26px;
+    max-height: 26px;
+    font-weight: 700;
 }
 QProgressBar::chunk {
-    background-color: #89b4fa;
+    background-color: #1e66f5;
     border-radius: 7px;
     margin: 1px;
 }
 QProgressBar#overallProgress {
-    min-height: 28px;
-    max-height: 28px;
-    font-weight: 600;
-    color: #cdd6f4;
-    border-color: #45475a;
+    min-height: 30px;
+    max-height: 30px;
+    font-weight: 700;
+    color: #ffffff;
+    border: 1px solid #a6adc8;
 }
 QProgressBar#overallProgress::chunk {
-    background-color: #a6e3a1;
+    background-color: #2f9e44;
     border-radius: 8px;
     margin: 2px;
 }

@@ -66,6 +66,9 @@ class LyricsConfig:
 
 @dataclass
 class LrcConfig:
+    enabled: bool = True             # LRC generation stage
+    embed_enabled: bool = True       # LRC embedding stage
+    skip_existing: bool = True       # skip tracks with a ready text.lrc
     language: Optional[str] = "ru"
     align_model: Optional[str] = None
     device: str = "auto"

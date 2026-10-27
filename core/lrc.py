@@ -37,6 +37,10 @@ def segments_to_lrc(segments: list[dict]) -> str:
         text = (seg.get("text") or "").strip()
         if not text:
             continue
+        # WhisperX can return multi-line text on long segments. An LRC line
+        # must be a single line: any newline would produce a broken line
+        # without a timestamp. Collapse all whitespace into single spaces.
+        text = re.sub(r"\s+", " ", text)
         start = float(seg.get("start", 0.0))
         lines.append(f"{format_timestamp(start)}{text}")
     return "\n".join(lines) + "\n"

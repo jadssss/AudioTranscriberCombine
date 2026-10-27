@@ -14,3 +14,4 @@ output/
 
 preset.json
 *.log
+combined_files.txt

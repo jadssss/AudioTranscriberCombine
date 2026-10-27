@@ -11,7 +11,9 @@ from .config import PipelineConfig
 from .convert import convert_to_wav
 from .lrc import embed_lrc, is_lrc, read_embedded_lyrics, segments_to_lrc
 from .metadata import read_metadata
-from .pipeline import FileResult, _save_unrecognized, collect_audio_files
+from .pipeline import (
+    FileResult, _artifact_belongs_to, _save_unrecognized, collect_audio_files,
+)
 from .transcribe import transcribe_aligned
 
 
@@ -45,6 +47,20 @@ def _pick_audio_source(
     return target
 
 
+def _ready_lrc(track_out: Path, source: Path) -> Optional[str]:
+    """Return existing valid LRC text for this exact source track, if any."""
+    if not _artifact_belongs_to(track_out, source):
+        return None
+    lrc_path = track_out / "text.lrc"
+    if not lrc_path.is_file():
+        return None
+    try:
+        content = lrc_path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    return content if content.strip() and is_lrc(content) else None
+
+
 def run_lrc_pipeline(
     config: PipelineConfig,
     log: LogFn = print,
@@ -58,6 +74,10 @@ def run_lrc_pipeline(
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    if not config.lrc.enabled:
+        log("LRC: генерация отключена — пропуск этапа")
+        return []
+
     files = collect_audio_files(input_dir, config.recursive)
     if not files:
         log("Аудиофайлы не найдены.")
@@ -69,6 +89,8 @@ def run_lrc_pipeline(
 
     results: list[FileResult] = []
     total = len(files)
+    if on_progress:
+        on_progress("lrc", 0, total)
     if on_overall_progress:
         on_overall_progress(0, total)
 
@@ -76,14 +98,23 @@ def run_lrc_pipeline(
         if stop_event is not None and stop_event.is_set():
             log("⏹ Отменено")
             break
-        if on_progress:
-            on_progress("lrc", idx - 1, total)
         log(f"\n▶ [{idx}/{total}] {f.name}")
 
         track_out = output_dir / f.stem
         track_out.mkdir(parents=True, exist_ok=True)
         lrc_path = track_out / "text.lrc"
         error: Optional[str] = None
+
+        if config.lrc.skip_existing:
+            ready = _ready_lrc(track_out, f)
+            if ready is not None:
+                log("  ⊘ text.lrc уже готов — пропуск")
+                results.append(FileResult(f, None, track_out, None, "existing+lrc"))
+                if on_progress:
+                    on_progress("lrc", idx, total)
+                if on_overall_progress:
+                    on_overall_progress(idx, total)
+                continue
 
         tmp = Path(tempfile.mkdtemp(prefix=f"at_lrc_{f.stem}_"))
         try:
@@ -151,6 +182,10 @@ def run_embed_pipeline(
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    if not config.lrc.embed_enabled:
+        log("LRC embed: встраивание отключено — пропуск этапа")
+        return []
+
     files = collect_audio_files(input_dir, config.recursive)
     if not files:
         log("Аудиофайлы не найдены.")
@@ -161,6 +196,8 @@ def run_embed_pipeline(
 
     results: list[FileResult] = []
     total = len(files)
+    if on_progress:
+        on_progress("embed", 0, total)
     if on_overall_progress:
         on_overall_progress(0, total)
 
@@ -168,8 +205,6 @@ def run_embed_pipeline(
         if stop_event is not None and stop_event.is_set():
             log("⏹ Отменено")
             break
-        if on_progress:
-            on_progress("embed", idx - 1, total)
 
         lrc_path = output_dir / f.stem / "text.lrc"
         error: Optional[str] = None

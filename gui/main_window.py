@@ -6,12 +6,12 @@ from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import Qt, QUrl
-from PySide6.QtGui import QColor, QDesktopServices
+from PySide6.QtGui import QColor, QDesktopServices, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout, QGroupBox,
-    QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox,
-    QPlainTextEdit, QProgressBar, QPushButton, QSpinBox, QTabWidget,
-    QVBoxLayout, QWidget,
+    QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout, QFrame,
+    QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox,
+    QPlainTextEdit, QProgressBar, QPushButton, QScrollArea, QSpinBox,
+    QTabWidget, QVBoxLayout, QWidget,
 )
 
 from core.config import (
@@ -71,8 +71,17 @@ class MainWindow(QMainWindow):
     # ---------------- UI ----------------
 
     def _build_ui(self) -> None:
+        # The whole page lives in a scroll area: on small screens the user can
+        # scroll down to the log instead of the console being cut off by the
+        # bottom edge of the window.
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setCentralWidget(scroll)
+
         central = QWidget()
-        self.setCentralWidget(central)
+        scroll.setWidget(central)
         root = QVBoxLayout(central)
         root.setContentsMargins(18, 16, 18, 16)
         root.setSpacing(12)
@@ -82,6 +91,10 @@ class MainWindow(QMainWindow):
         title.setObjectName("appTitle")
         header.addWidget(title)
         header.addStretch(1)
+        self.fullscreen_btn = QPushButton("⛶  На весь экран")
+        self.fullscreen_btn.setToolTip("Развернуть окно на весь экран (F11)")
+        self.fullscreen_btn.clicked.connect(self._toggle_fullscreen)
+        header.addWidget(self.fullscreen_btn)
         self.device_label = QLabel("")
         self.device_label.setObjectName("deviceInfo")
         header.addWidget(self.device_label)
@@ -153,6 +166,7 @@ class MainWindow(QMainWindow):
         self.convert_enabled_cb.toggled.connect(self._sync_tab_indicators)
         self.separate_enabled_cb.toggled.connect(self._sync_tab_indicators)
         self.transcribe_enabled_cb.toggled.connect(self._sync_tab_indicators)
+        self.lrc_enabled_cb.toggled.connect(self._sync_tab_indicators)
         self.engine_cb.currentTextChanged.connect(self._sync_engine_fields)
 
         row = QHBoxLayout()
@@ -191,8 +205,24 @@ class MainWindow(QMainWindow):
         self.log_view = QPlainTextEdit()
         self.log_view.setObjectName("log")
         self.log_view.setReadOnly(True)
+        self.log_view.setMinimumHeight(240)
         self.log_view.setPlaceholderText("Здесь появится лог выполнения…")
         root.addWidget(self.log_view, 1)
+
+        self._fs_shortcut = QShortcut(QKeySequence("F11"), self)
+        self._fs_shortcut.activated.connect(self._toggle_fullscreen)
+        self._esc_shortcut = QShortcut(QKeySequence("Escape"), self)
+        self._esc_shortcut.activated.connect(self._leave_fullscreen)
+
+    def _toggle_fullscreen(self) -> None:
+        if self.isFullScreen():
+            self.showNormal()
+        else:
+            self.showFullScreen()
+
+    def _leave_fullscreen(self) -> None:
+        if self.isFullScreen():
+            self.showNormal()
 
     def _with_browse(self, edit: QLineEdit, picker) -> QWidget:
         w = QWidget()
@@ -374,6 +404,25 @@ class MainWindow(QMainWindow):
         info.setStyleSheet("color: #a6adc8;")
         form.addRow(info)
 
+        self.lrc_enabled_cb = QCheckBox("Включён (генерация LRC)")
+        self.lrc_enabled_cb.setToolTip(
+            "Отключите, чтобы пропустить этап генерации text.lrc.\n"
+            "Остальные этапы пайплайна продолжат работать."
+        )
+        form.addRow("", self.lrc_enabled_cb)
+        self.lrc_embed_enabled_cb = QCheckBox("Включён (встраивание LRC в аудио)")
+        self.lrc_embed_enabled_cb.setToolTip(
+            "Отключите, чтобы пропустить этап встраивания LRC в теги аудио."
+        )
+        form.addRow("", self.lrc_embed_enabled_cb)
+        self.lrc_skip_existing_cb = QCheckBox("Пропускать готовые text.lrc")
+        self.lrc_skip_existing_cb.setToolTip(
+            "Если <output>/<stem>/text.lrc уже существует и содержит корректный LRC,\n"
+            "файл не будет пересчитан. Папка с metadata.json от другого трека\n"
+            "готовой не считается."
+        )
+        form.addRow("", self.lrc_skip_existing_cb)
+
         self.lrc_audio_source_cb = QComboBox()
         self.lrc_audio_source_cb.addItems(["auto", "vocals", "convert", "input"])
         self.lrc_audio_source_cb.setToolTip(
@@ -433,6 +482,7 @@ class MainWindow(QMainWindow):
         bar.setTabTextColor(2, active if self.convert_enabled_cb.isChecked() else inactive)
         bar.setTabTextColor(3, active if self.separate_enabled_cb.isChecked() else inactive)
         bar.setTabTextColor(4, active if self.transcribe_enabled_cb.isChecked() else inactive)
+        bar.setTabTextColor(5, active if self.lrc_enabled_cb.isChecked() else inactive)
 
     def _sync_engine_fields(self) -> None:
         is_whisperx = self.engine_cb.currentText() == "whisperx"
@@ -503,6 +553,9 @@ class MainWindow(QMainWindow):
         self.lrc_align_model_edit.setText(cfg.lrc.align_model or "")
         self.lrc_device_cb.setCurrentText(cfg.lrc.device)
         self.lrc_embed_in_place_cb.setChecked(cfg.lrc.embed_in_place)
+        self.lrc_enabled_cb.setChecked(cfg.lrc.enabled)
+        self.lrc_embed_enabled_cb.setChecked(cfg.lrc.embed_enabled)
+        self.lrc_skip_existing_cb.setChecked(cfg.lrc.skip_existing)
         self.chunk_size_spin.setValue(cfg.chunk_size)
 
     def _collect_config(self) -> PipelineConfig:
@@ -562,6 +615,9 @@ class MainWindow(QMainWindow):
         )
         lrc_lang = self.lrc_language_cb.currentText().strip()
         cfg.lrc = LrcConfig(
+            enabled=self.lrc_enabled_cb.isChecked(),
+            embed_enabled=self.lrc_embed_enabled_cb.isChecked(),
+            skip_existing=self.lrc_skip_existing_cb.isChecked(),
             language=None if lrc_lang in ("", "auto") else lrc_lang,
             align_model=self.lrc_align_model_edit.text().strip() or None,
             device=self.lrc_device_cb.currentText(),
@@ -640,6 +696,18 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(
                 self, "LRC требует WhisperX",
                 "Align-модель доступна только для WhisperX. Переключите движок на whisperx."
+            )
+            return
+        if task == "lrc" and not cfg.lrc.enabled:
+            QMessageBox.warning(
+                self, "LRC отключён",
+                "Этап генерации LRC выключен. Включите его на вкладке LRC."
+            )
+            return
+        if task == "embed" and not cfg.lrc.embed_enabled:
+            QMessageBox.warning(
+                self, "Встраивание LRC отключено",
+                "Этап встраивания LRC выключен. Включите его на вкладке LRC."
             )
             return
 
