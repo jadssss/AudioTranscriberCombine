@@ -158,6 +158,25 @@ def _write_metadata_json(path: Path, data: Optional[dict]) -> None:
     path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
+def _merge_metadata_file(existing: Path, data: Optional[dict]) -> Optional[dict]:
+    """Keep tags/shazam from an earlier run when the new data has less info.
+
+    Reprocessing a track for one stage only (e.g. separation) must not replace
+    a rich metadata.json with a path-only dict.
+    """
+    if not data or not existing.is_file():
+        return data
+    try:
+        old = json.loads(existing.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return data
+    if not isinstance(old, dict):
+        return data
+    merged = dict(old)
+    merged.update(data)
+    return merged
+
+
 def _existing_artifacts(
     output_root: Path, input_path: Path,
 ) -> tuple[bool, bool, bool]:
@@ -176,26 +195,61 @@ def _existing_artifacts(
     )
 
 
+def _final_artifact_present(track_out: Path, config: PipelineConfig) -> bool:
+    """True if the artifact of the last enabled stage already exists.
+
+    ``skip_existing`` must not treat an old ``text.txt`` as "done" when the
+    current run only needs separation: the final stage here is ``vocals.wav``,
+    and without it the track still has work to do.
+    """
+    if config.transcribe.enabled:
+        return (track_out / "text.txt").is_file()
+    if config.separate.enabled:
+        return (track_out / "vocals.wav").is_file()
+    if config.convert.enabled:
+        return (track_out / "convert.wav").is_file()
+    return False
+
+
+def _is_track_finished(
+    track_out: Path, config: PipelineConfig, belongs: bool = True,
+) -> bool:
+    """True when ``skip_existing`` may skip this output folder entirely."""
+    if not belongs:
+        return False
+    if _final_artifact_present(track_out, config):
+        return True
+    # Identification-only runs still finish with text.txt (no other stage
+    # produces an artifact of its own).
+    if (not config.convert.enabled and not config.separate.enabled
+            and not config.transcribe.enabled
+            and (config.shazam.enabled or config.lyrics.enabled)):
+        return (track_out / "text.txt").is_file()
+    return False
+
+
 def _needs_work(config: PipelineConfig, output_root: Path, f: Path) -> bool:
     """True if at least one enabled stage still has to do something for ``f``.
 
     This mirrors the resume rules used by the staged/sequential pipelines:
-      * text.txt + skip_existing        -> resolved, nothing to do
+      * final artifact present + skip_existing -> resolved, nothing to do
       * vocals.wav + resume_partial     -> convert/separate are skipped
       * convert.wav + resume_partial    -> convert is skipped
     Files with no pending work are filtered out before batching, so batches
     stay full instead of being filled by already-finished tracks.
     """
+    track_out = output_root / f.stem
+    belongs = _artifact_belongs_to(track_out, f)
     has_text, has_vocals, has_convert = _existing_artifacts(output_root, f)
 
-    if config.skip_existing and has_text:
-        return False  # resolved by the same rule the pipelines use
+    if config.skip_existing and _is_track_finished(track_out, config, belongs):
+        return False
 
     vocals_ready = config.resume_partial and has_vocals
     convert_ready = config.resume_partial and (has_vocals or has_convert)
 
     if config.shazam.enabled or config.lyrics.enabled:
-        return True  # identification still has to run (no resolved text)
+        return True  # identification still has to run
     if config.convert.enabled and not convert_ready:
         return True
     if config.separate.enabled and not vocals_ready:
@@ -597,7 +651,7 @@ def run_pipeline(
     if config.lyrics.enabled:
         log(f"  LRCLIB: включён (порог fuzzy={config.lyrics.fuzzy_threshold:.2f})")
     if config.skip_existing:
-        log("  Resume: готовые файлы (text.txt) будут пропущены")
+        log("  Resume: готовые файлы (результат последнего этапа) будут пропущены")
     if config.resume_partial:
         log("  Resume: существующие vocals.wav / convert.wav будут переиспользованы")
 
@@ -667,22 +721,23 @@ def _run_sequential(
         track_out.mkdir(parents=True, exist_ok=True)
         belongs = _artifact_belongs_to(track_out, f)
 
-        if config.skip_existing:
+        if config.skip_existing and _is_track_finished(track_out, config, belongs):
             existing_text = track_out / "text.txt"
-            if existing_text.is_file() and belongs:
+            existing: Optional[str] = None
+            if existing_text.is_file():
                 try:
                     existing = existing_text.read_text(encoding="utf-8")
                 except OSError:
                     existing = None
-                log("  ⊘ text.txt уже есть — пропуск")
-                if on_progress:
-                    on_progress("file", idx, total)
-                if on_overall_progress:
-                    on_overall_progress(
-                        min(overall_base + idx, overall_total), overall_total,
-                    )
-                results.append(FileResult(f, existing, track_out, None, "existing"))
-                continue
+            log("  ⊘ результат последнего этапа уже есть — пропуск")
+            if on_progress:
+                on_progress("file", idx, total)
+            if on_overall_progress:
+                on_overall_progress(
+                    min(overall_base + idx, overall_total), overall_total,
+                )
+            results.append(FileResult(f, existing, track_out, None, "existing"))
+            continue
 
         tmp_root = Path(tempfile.mkdtemp(prefix=f"at_{f.stem}_"))
 
@@ -791,6 +846,10 @@ def _run_sequential(
             metadata_dict = _build_metadata_dict(
                 ident.metadata, ident.shazam, source, input_path=f,
             )
+            if belongs:
+                metadata_dict = _merge_metadata_file(
+                    track_out / "metadata.json", metadata_dict,
+                )
             if metadata_dict:
                 _write_metadata_json(tmp_root / "metadata.json", metadata_dict)
 
@@ -999,14 +1058,15 @@ def _run_staged_batch(
                 log(f"  ⚠ {f.name}: папка {track_out.name} относится к другому треку — обрабатываю заново")
 
         text_file = track_out / "text.txt"
-        if config.skip_existing and belongs and text_file.is_file():
+        if config.skip_existing and _is_track_finished(track_out, config, belongs):
             resolved = True
             skipped_existing += 1
             source = "existing"
-            try:
-                text = text_file.read_text(encoding="utf-8")
-            except OSError:
-                text = None
+            if text_file.is_file():
+                try:
+                    text = text_file.read_text(encoding="utf-8")
+                except OSError:
+                    text = None
         elif config.resume_partial and belongs:
             vocals = track_out / "vocals.wav"
             convert = track_out / "convert.wav"
@@ -1028,7 +1088,7 @@ def _run_staged_batch(
         }
 
     if skipped_existing:
-        log(f"  ⊘ Пропущено готовых (text.txt): {skipped_existing}")
+        log(f"  ⊘ Пропущено готовых (результат последнего этапа): {skipped_existing}")
     if resumed_partial:
         log(f"  ↻ Подхвачено промежуточных (vocals/convert): {resumed_partial}")
     if mismatched_folders:
@@ -1289,6 +1349,11 @@ def _run_staged_batch(
 
             track_out = output_root / f.stem
             track_out.mkdir(parents=True, exist_ok=True)
+            if _artifact_belongs_to(track_out, f):
+                metadata_dict = _merge_metadata_file(
+                    track_out / "metadata.json", metadata_dict,
+                )
+                s["metadata_dict"] = metadata_dict
 
             audio_work = s["audio_path"]
             if isinstance(audio_work, Path) and audio_work != f:
