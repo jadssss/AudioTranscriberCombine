@@ -19,7 +19,9 @@ from .lyrics import LyricsMatch, search_by_identity, search_by_text
 from .metadata import TrackMetadata, read_metadata
 from .recognize import ShazamResult, recognize
 from .separate import separate_vocals, separate_vocals_batch
-from .transcribe import CudaOOMError, transcribe
+from .transcribe import (
+    CudaOOMError, preload_transcription_model, transcribe,
+)
 from .lrc import is_lrc, read_embedded_lyrics
 
 
@@ -1261,6 +1263,20 @@ def _run_staged_batch(
         if config.transcribe.enabled and not cancelled():
             todo = active()
             log(f"\n══ Этап 3 · Транскрибация ({len(todo)} файлов) ══")
+            if todo:
+                # Load once, after separation has finished. Every later file
+                # and every later batch reuses this instance.
+                try:
+                    preload_transcription_model(
+                        engine=config.transcribe.engine,
+                        model=config.transcribe.model,
+                        device=config.transcribe.device,
+                        compute_type=config.transcribe.compute_type,
+                        gigaam_provider=config.transcribe.gigaam_provider,
+                        local_files_only=config.transcribe.local_files_only,
+                    )
+                except Exception as e:  # noqa: BLE001
+                    log(f"  ⚠ Не удалось загрузить модель заранее: {e}")
             progress("transcribe", 0, len(todo))
             for i, f in enumerate(todo, 1):
                 if cancelled():

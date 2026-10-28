@@ -6,9 +6,19 @@ Models are cached; aggressive VRAM cleanup happens after each file.
 from __future__ import annotations
 
 import gc
+import threading
 import time
 from pathlib import Path
 from typing import Optional
+
+
+# The model caches below are process-wide. They are intentionally never
+# cleared between files or batches: reloading WhisperX takes minutes and is
+# what made runs look like they reloaded the model every batch. The lock makes
+# the "load once, reuse forever" guarantee safe even if ASR is ever called
+# from multiple threads.
+_MODEL_LOCK = threading.RLock()
+_REUSE_LOGGED: set = set()
 
 
 class CudaOOMError(RuntimeError):
@@ -110,23 +120,27 @@ class _WhisperXModels:
         if compute_type is None:
             compute_type = "int8_float16" if device == "cuda" else "int8"
         key = (model_name, device, compute_type, local_files_only)
-        if key not in cls._cache:
-            if device == "cuda":
-                _enable_tf32()
-            import whisperx
-            print(f"  [ASR] loading WhisperX {model_name} on {device} "
-                  f"({compute_type}, local_files_only={local_files_only})...")
+        with _MODEL_LOCK:
+            if key not in cls._cache:
+                if device == "cuda":
+                    _enable_tf32()
+                import whisperx
+                print(f"  [ASR] loading WhisperX {model_name} on {device} "
+                      f"({compute_type}, local_files_only={local_files_only})...")
 
-            def load():
-                return whisperx.load_model(
-                    model_name, device,
-                    compute_type=compute_type,
-                    local_files_only=local_files_only,
-                )
+                def load():
+                    return whisperx.load_model(
+                        model_name, device,
+                        compute_type=compute_type,
+                        local_files_only=local_files_only,
+                    )
 
-            cls._cache[key] = _retry(load)
-            print("  [ASR] model loaded.")
-        return cls._cache[key]
+                cls._cache[key] = _retry(load)
+                print("  [ASR] model loaded once — subsequent files will reuse it.")
+            elif ("whisperx",) + key not in _REUSE_LOGGED:
+                _REUSE_LOGGED.add(("whisperx",) + key)
+                print(f"  [ASR] reusing loaded WhisperX {model_name} ({device}).")
+            return cls._cache[key]
 
 
 class _AlignModels:
@@ -135,20 +149,24 @@ class _AlignModels:
     @classmethod
     def get(cls, language_code: str, device: str, model_name: Optional[str] = None):
         key = (language_code, device, model_name or "")
-        if key not in cls._cache:
-            import whisperx
-            print(f"  [ALIGN] loading align model for {language_code} "
-                  f"({model_name or 'default'}) on {device}...")
+        with _MODEL_LOCK:
+            if key not in cls._cache:
+                import whisperx
+                print(f"  [ALIGN] loading align model for {language_code} "
+                      f"({model_name or 'default'}) on {device}...")
 
-            def load():
-                kwargs = {"language_code": language_code, "device": device}
-                if model_name:
-                    kwargs["model_name"] = model_name
-                return whisperx.load_align_model(**kwargs)
+                def load():
+                    kwargs = {"language_code": language_code, "device": device}
+                    if model_name:
+                        kwargs["model_name"] = model_name
+                    return whisperx.load_align_model(**kwargs)
 
-            cls._cache[key] = _retry(load)
-            print("  [ALIGN] align model loaded.")
-        return cls._cache[key]
+                cls._cache[key] = _retry(load)
+                print("  [ALIGN] align model loaded once — reusing it.")
+            elif ("align",) + key not in _REUSE_LOGGED:
+                _REUSE_LOGGED.add(("align",) + key)
+                print(f"  [ALIGN] reusing loaded align model for {language_code}.")
+            return cls._cache[key]
 
 
 class _GigaAMModels:
@@ -162,14 +180,37 @@ class _GigaAMModels:
             "auto": ["CUDAExecutionProvider", "CPUExecutionProvider"],
         }.get(provider, ["CPUExecutionProvider"])
         key = tuple(providers)
-        if key not in cls._cache:
-            import onnx_asr
+        with _MODEL_LOCK:
+            if key not in cls._cache:
+                import onnx_asr
 
-            def load():
-                return onnx_asr.load_model("gigaam-v3-ctc", providers=list(providers))
+                def load():
+                    return onnx_asr.load_model("gigaam-v3-ctc", providers=list(providers))
 
-            cls._cache[key] = _retry(load)
-        return cls._cache[key]
+                cls._cache[key] = _retry(load)
+            return cls._cache[key]
+
+
+def preload_transcription_model(
+    engine: str = "whisperx",
+    model: str = "large-v3",
+    device: str = "auto",
+    compute_type: Optional[str] = None,
+    gigaam_provider: str = "auto",
+    local_files_only: bool = False,
+) -> None:
+    """Load the ASR model once so the per-file loop only reuses it.
+
+    All model caches are process-wide and are never cleared between files,
+    batches or pipeline runs. This helper just makes the first load explicit.
+    """
+    device = _resolve_device(device)
+    if engine == "whisperx":
+        _WhisperXModels.get(model, device, compute_type, local_files_only)
+    elif engine == "gigaam":
+        _GigaAMModels.get(gigaam_provider)
+    else:
+        raise ValueError(f"Unknown ASR engine: {engine!r}")
 
 
 def transcribe(
