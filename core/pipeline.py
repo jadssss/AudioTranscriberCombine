@@ -1378,7 +1378,10 @@ def _run_staged_batch(
                 config, f, text, source,
                 metadata=(ident.metadata if ident else None),
             )
-            log(f"  ✓ {f.name}")
+            if text is not None or s["resolved"]:
+                log(f"  ✓ {f.name}")
+            else:
+                log(f"  ⊘ {f.name}: пропущен (нет текста)")
             mark_overall(is_complete(s))
 
     finally:

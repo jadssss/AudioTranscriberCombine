@@ -74,31 +74,29 @@ def _enable_tf32() -> None:
 
 
 def _model_transcribe_with_retry(
-    model_obj, audio, language, batch_size, vad_filter, name="<audio>",
+    model_obj, audio, language, batch_size, name="<audio>",
 ):
     """Try progressively lighter settings so one long file can still finish.
 
     The loaded model is intentionally kept in the cache between attempts:
     reloading it costs minutes and does not help with an OOM caused by a long
-    audio file. If even batch=1 without VAD fails, raise CudaOOMError so the
-    caller can skip this file and continue with the rest of the batch.
+    audio file. VAD is not touched here — WhisperX expects it at model-load
+    time (``vad_model``/``vad_options``), not per transcription call. If even
+    batch=1 fails, raise CudaOOMError so the caller can skip this file and
+    continue with the rest of the batch.
     """
-    attempts = [
-        (batch_size, vad_filter),   # as configured
-        (1, False),                 # minimum memory: no Pyannote VAD, batch=1
-        (1, False),                 # one more time after empty_cache()
-    ]
+    attempts = [batch_size, 1, 1]
     last: Optional[Exception] = None
-    for i, (bs, vad) in enumerate(attempts, 1):
+    for i, bs in enumerate(attempts, 1):
         try:
             return model_obj.transcribe(
-                audio, batch_size=bs, language=language, vad_filter=vad,
+                audio, batch_size=bs, language=language,
             )
         except Exception as e:  # noqa: BLE001
             if not _is_cuda_error(e):
                 raise
             last = e
-            print(f"  [ASR] OOM on {name} (attempt {i}/3, bs={bs}, vad={vad}): {e}")
+            print(f"  [ASR] OOM on {name} (attempt {i}/3, bs={bs}): {e}")
             _free_vram()
     raise CudaOOMError(f"OOM after 3 attempts on {name}: {last}") from last
 
@@ -213,7 +211,7 @@ def _transcribe_whisperx(
     model = _WhisperXModels.get(model_name, device, compute_type, local_files_only)
     audio = whisperx.load_audio(str(audio_path))
     result = _model_transcribe_with_retry(
-        model, audio, language, batch_size, vad_filter, name=audio_path.name,
+        model, audio, language, batch_size, name=audio_path.name,
     )
     text = " ".join(seg["text"].strip() for seg in result["segments"]).strip()
     del audio, result
@@ -247,7 +245,7 @@ def transcribe_aligned(
     model_obj = _WhisperXModels.get(model, device, compute_type, local_files_only)
     audio = whisperx.load_audio(str(audio_path))
     result = _model_transcribe_with_retry(
-        model_obj, audio, language, batch_size, vad_filter, name=audio_path.name,
+        model_obj, audio, language, batch_size, name=audio_path.name,
     )
 
     detected = result.get("language") or language or "en"
