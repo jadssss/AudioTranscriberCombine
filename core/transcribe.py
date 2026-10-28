@@ -20,6 +20,27 @@ from typing import Optional
 _MODEL_LOCK = threading.RLock()
 _REUSE_LOGGED: set = set()
 
+# CUDA context failures that cannot be recovered by retrying or empty_cache().
+# They require restarting the app (or switching to CPU).
+_DEAD_CUDA_MARKERS = (
+    "invalid device ordinal",
+    "cudaerrorinvaliddevice",
+    "device-side assert",
+    "unspecified launch failure",
+)
+
+
+def _is_dead_cuda(exc: BaseException) -> bool:
+    err = str(exc).lower()
+    return any(m in err for m in _DEAD_CUDA_MARKERS)
+
+
+def _clear_model_caches() -> None:
+    _WhisperXModels._cache.clear()
+    _AlignModels._cache.clear()
+    _GigaAMModels._cache.clear()
+    _REUSE_LOGGED.clear()
+
 
 class CudaOOMError(RuntimeError):
     """CUDA OOM, переживший все стратегии понижения нагрузки."""
@@ -91,11 +112,13 @@ def _model_transcribe_with_retry(
     The loaded model is intentionally kept in the cache between attempts:
     reloading it costs minutes and does not help with an OOM caused by a long
     audio file. VAD is not touched here — WhisperX expects it at model-load
-    time (``vad_model``/``vad_options``), not per transcription call. If even
-    batch=1 fails, raise CudaOOMError so the caller can skip this file and
-    continue with the rest of the batch.
+    time (``vad_model``/``vad_options``), not per transcription call. A dead
+    CUDA context is never retried: caches are dropped and CudaOOMError is
+    raised immediately. If even batch=1 fails with a normal OOM, raise
+    CudaOOMError so the caller can skip this file and continue with the rest
+    of the batch.
     """
-    attempts = [batch_size, 1, 1]
+    attempts = [batch_size, 1]
     last: Optional[Exception] = None
     for i, bs in enumerate(attempts, 1):
         try:
@@ -103,12 +126,20 @@ def _model_transcribe_with_retry(
                 audio, batch_size=bs, language=language,
             )
         except Exception as e:  # noqa: BLE001
+            if _is_dead_cuda(e):
+                _clear_model_caches()
+                raise CudaOOMError(
+                    f"CUDA context died on {name}: {e}. "
+                    "GPU state is unrecoverable — restart the app or switch to CPU."
+                ) from e
             if not _is_cuda_error(e):
                 raise
             last = e
-            print(f"  [ASR] OOM on {name} (attempt {i}/3, bs={bs}): {e}")
+            print(f"  [ASR] OOM on {name} (attempt {i}/{len(attempts)}, bs={bs}): {e}")
             _free_vram()
-    raise CudaOOMError(f"OOM after 3 attempts on {name}: {last}") from last
+    raise CudaOOMError(
+        f"OOM after {len(attempts)} attempts on {name}: {last}"
+    ) from last
 
 
 class _WhisperXModels:

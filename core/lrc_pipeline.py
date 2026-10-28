@@ -146,6 +146,13 @@ def run_lrc_pipeline(
             )
 
             lrc_content = segments_to_lrc(segments)
+            if not lrc_content.strip():
+                log(f"  ⚠ {f.name}: текст не извлечён (пустой результат ASR)")
+                results.append(FileResult(
+                    f, None, None,
+                    "EmptyResult: ASR returned no text", "lrc+empty",
+                ))
+                continue
             lrc_path.write_text(lrc_content, encoding="utf-8")
             log(f"  ✓ text.lrc ({len(segments)} строк, язык: {detected})")
 

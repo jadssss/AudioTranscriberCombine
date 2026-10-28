@@ -219,7 +219,9 @@ class MainWindow(QMainWindow):
         self.log_view = QPlainTextEdit()
         self.log_view.setObjectName("log")
         self.log_view.setReadOnly(True)
-        self.log_view.setMinimumHeight(240)
+        # Keep at least ~12 log lines visible regardless of the UI font size.
+        line_height = self.log_view.fontMetrics().lineSpacing()
+        self.log_view.setMinimumHeight(max(280, line_height * 12 + 24))
         self.log_view.setPlaceholderText("Здесь появится лог выполнения…")
         root.addWidget(self.log_view, 1)
 

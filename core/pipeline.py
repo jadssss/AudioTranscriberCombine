@@ -836,14 +836,21 @@ def _run_sequential(
                     gigaam_provider=config.transcribe.gigaam_provider,
                     local_files_only=config.transcribe.local_files_only,
                 )
+                text = (text or "").strip()
                 source = config.transcribe.engine
-                log(f"  ✓ распознано {len(text)} символов")
-                if (config.lyrics.enabled and config.lyrics.try_after_asr):
-                    matched = _try_post_asr_match(text, config, log)
-                    if matched:
-                        text = matched
-                        source = f"{source}+lrclib"
-                (tmp_root / "text.txt").write_text(text, encoding="utf-8")
+                if not text:
+                    text = None
+                    source = "empty_result"
+                    error = "EmptyResult: ASR returned no text"
+                    log(f"  ⚠ {f.name}: текст не извлечён (пустой результат ASR)")
+                else:
+                    log(f"  ✓ распознано {len(text)} символов")
+                    if (config.lyrics.enabled and config.lyrics.try_after_asr):
+                        matched = _try_post_asr_match(text, config, log)
+                        if matched:
+                            text = matched
+                            source = f"{source}+lrclib"
+                    (tmp_root / "text.txt").write_text(text, encoding="utf-8")
 
             metadata_dict = _build_metadata_dict(
                 ident.metadata, ident.shazam, source, input_path=f,
@@ -873,7 +880,7 @@ def _run_sequential(
         except CudaOOMError as e:
             error = f"CudaOOMError: {e}"
             source = "oom_skipped"
-            log(f"  ⊘ {f.name}: OOM после 3 попыток — пропущен, идём дальше")
+            log(f"  ⊘ {f.name}: OOM после ретраев — пропущен, идём дальше")
         except Exception as e:  # noqa: BLE001
             error = f"{type(e).__name__}: {e}"
             log(f"  ✗ Ошибка: {error}")
@@ -1293,9 +1300,16 @@ def _run_staged_batch(
                         gigaam_provider=config.transcribe.gigaam_provider,
                         local_files_only=config.transcribe.local_files_only,
                     )
-                    state[f]["text"] = text
-                    state[f]["source"] = config.transcribe.engine
-                    log(f"  ✓ {f.name} ({len(text)} символов)")
+                    text = (text or "").strip()
+                    if not text:
+                        state[f]["text"] = None
+                        state[f]["source"] = "empty_result"
+                        state[f]["error"] = "EmptyResult: ASR returned no text"
+                        log(f"  ⚠ {f.name}: текст не извлечён (пустой результат ASR)")
+                    else:
+                        state[f]["text"] = text
+                        state[f]["source"] = config.transcribe.engine
+                        log(f"  ✓ {f.name} ({len(text)} символов)")
                 except CudaOOMError as e:
                     state[f]["error"] = f"CudaOOMError: {e}"
                     state[f]["source"] = "oom_skipped"
