@@ -12,7 +12,8 @@ from .convert import convert_to_wav
 from .lrc import embed_lrc, is_lrc, read_embedded_lyrics, segments_to_lrc
 from .metadata import read_metadata
 from .pipeline import (
-    FileResult, _artifact_belongs_to, _save_unrecognized, collect_audio_files,
+    FileResult, _artifact_belongs_to, _output_dir_for, _save_unrecognized,
+    collect_audio_files,
 )
 from .transcribe import CudaOOMError, transcribe_aligned
 
@@ -23,11 +24,13 @@ OverallFn = Callable[[int, int], None]        # completed_files, total_files
 
 
 def _pick_audio_source(
-    f: Path, output_dir: Path, config: PipelineConfig, work_dir: Path, log: LogFn,
+    f: Path, input_root: Path, output_dir: Path, config: PipelineConfig,
+    work_dir: Path, log: LogFn,
 ) -> Path:
     mode = (config.lrc.audio_source or "auto").lower()
-    vocals = output_dir / f.stem / "vocals.wav"
-    convert = output_dir / f.stem / "convert.wav"
+    track_out = _output_dir_for(f, input_root, output_dir)
+    vocals = track_out / "vocals.wav"
+    convert = track_out / "convert.wav"
     if mode == "vocals":
         return vocals
     if mode == "convert":
@@ -100,7 +103,7 @@ def run_lrc_pipeline(
             break
         log(f"\n▶ [{idx}/{total}] {f.name}")
 
-        track_out = output_dir / f.stem
+        track_out = _output_dir_for(f, input_dir, output_dir)
         track_out.mkdir(parents=True, exist_ok=True)
         lrc_path = track_out / "text.lrc"
         error: Optional[str] = None
@@ -125,7 +128,9 @@ def run_lrc_pipeline(
                 results.append(FileResult(f, None, track_out, None, "embedded+lrc"))
                 continue
 
-            audio_path = _pick_audio_source(f, output_dir, config, tmp, log)
+            audio_path = _pick_audio_source(
+                f, input_dir, output_dir, config, tmp, log,
+            )
             if not audio_path.exists():
                 raise FileNotFoundError(
                     f"Источник аудио не найден: {audio_path}. "
@@ -217,7 +222,8 @@ def run_embed_pipeline(
             log("⏹ Отменено")
             break
 
-        lrc_path = output_dir / f.stem / "text.lrc"
+        track_out = _output_dir_for(f, input_dir, output_dir)
+        lrc_path = track_out / "text.lrc"
         error: Optional[str] = None
 
         try:
@@ -231,7 +237,7 @@ def run_embed_pipeline(
             if config.lrc.embed_in_place:
                 target = f
             else:
-                target = output_dir / f.stem / f.name
+                target = track_out / f.name
                 target.parent.mkdir(parents=True, exist_ok=True)
                 if not target.exists() or config.overwrite:
                     shutil.copy2(f, target)

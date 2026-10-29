@@ -179,15 +179,24 @@ def _merge_metadata_file(existing: Path, data: Optional[dict]) -> Optional[dict]
     return merged
 
 
+def _output_dir_for(f: Path, input_root: Path, output_root: Path) -> Path:
+    """Path-based track folder: output/<relpath_without_ext>/."""
+    try:
+        rel = f.relative_to(input_root)
+    except ValueError:
+        rel = Path(f.name)
+    return output_root / rel.with_suffix("")
+
+
 def _existing_artifacts(
-    output_root: Path, input_path: Path,
+    input_root: Path, output_root: Path, input_path: Path,
 ) -> tuple[bool, bool, bool]:
     """Return (has_text, has_vocals, has_convert) for the matching output folder.
 
     Artifacts are ignored when ``metadata.json`` says the folder belongs to a
     different input file with the same stem.
     """
-    track_out = output_root / input_path.stem
+    track_out = _output_dir_for(input_path, input_root, output_root)
     if not _artifact_belongs_to(track_out, input_path):
         return False, False, False
     return (
@@ -230,7 +239,9 @@ def _is_track_finished(
     return False
 
 
-def _needs_work(config: PipelineConfig, output_root: Path, f: Path) -> bool:
+def _needs_work(
+    config: PipelineConfig, input_root: Path, output_root: Path, f: Path,
+) -> bool:
     """True if at least one enabled stage still has to do something for ``f``.
 
     This mirrors the resume rules used by the staged/sequential pipelines:
@@ -240,9 +251,11 @@ def _needs_work(config: PipelineConfig, output_root: Path, f: Path) -> bool:
     Files with no pending work are filtered out before batching, so batches
     stay full instead of being filled by already-finished tracks.
     """
-    track_out = output_root / f.stem
+    track_out = _output_dir_for(f, input_root, output_root)
     belongs = _artifact_belongs_to(track_out, f)
-    has_text, has_vocals, has_convert = _existing_artifacts(output_root, f)
+    has_text, has_vocals, has_convert = _existing_artifacts(
+        input_root, output_root, f,
+    )
 
     if config.skip_existing and _is_track_finished(track_out, config, belongs):
         return False
@@ -660,7 +673,7 @@ def run_pipeline(
     # Pre-scan before chunking: remove files that are already complete for the
     # current set of enabled stages. Without this, skipped tracks consumed
     # batch slots and a staged run produced many half-empty batches.
-    pending = [f for f in files if _needs_work(config, output_dir, f)]
+    pending = [f for f in files if _needs_work(config, input_dir, output_dir, f)]
     already_done = total_all - len(pending)
     if already_done:
         log(f"  ✓ Уже готово: {already_done} — в батчи не попадут")
@@ -678,10 +691,12 @@ def run_pipeline(
         return _run_staged(
             config, files, log, on_progress, stop_event, on_overall_progress,
             overall_base=already_done, overall_total=total_all,
+            input_root=input_dir,
         )
     return _run_sequential(
         config, files, log, on_progress, stop_event, on_overall_progress,
         overall_base=already_done, overall_total=total_all,
+        input_root=input_dir,
     )
 
 
@@ -691,18 +706,22 @@ def _run_sequential(
     on_overall_progress: Optional[OverallFn] = None,
     overall_base: int = 0,
     overall_total: Optional[int] = None,
+    input_root: Optional[Path] = None,
 ) -> list[FileResult]:
     total = len(files)
     if overall_total is None:
-        overall_total = total
+        overall_total = overall_base + total
+    if input_root is None:
+        input_root = Path(config.input_dir)
     results: list[FileResult] = []
     output_root = Path(config.output_dir)
+    log("Раскладка: output/<relpath_from_input>/<stem>/")
     ident_tmp = Path(tempfile.mkdtemp(prefix="at_ident_"))
     ident_files = files
     if config.skip_existing:
         ident_files = [
             f for f in files
-            if not (output_root / f.stem / "text.txt").is_file()
+            if not (_output_dir_for(f, input_root, output_root) / "text.txt").is_file()
         ]
     try:
         ident_map = _run_identification_parallel(
@@ -719,9 +738,14 @@ def _run_sequential(
             on_progress("file", idx - 1, total)
         log(f"\n▶ [{idx}/{total}] {f.name}")
 
-        track_out = output_root / f.stem
+        track_out = _output_dir_for(f, input_root, output_root)
         track_out.mkdir(parents=True, exist_ok=True)
         belongs = _artifact_belongs_to(track_out, f)
+        if not belongs and any(
+            (track_out / name).exists()
+            for name in ("text.txt", "vocals.wav", "convert.wav")
+        ):
+            log(f"  ⚠ коллизия раскладки: {track_out} занят другим треком — обрабатываю заново")
 
         if config.skip_existing and _is_track_finished(track_out, config, belongs):
             existing_text = track_out / "text.txt"
@@ -924,13 +948,17 @@ def _run_staged(
     on_overall_progress: Optional[OverallFn] = None,
     overall_base: int = 0,
     overall_total: Optional[int] = None,
+    input_root: Optional[Path] = None,
 ) -> list[FileResult]:
     """Chunked staged mode: process `chunk_size` files, free memory, repeat."""
     output_root = Path(config.output_dir)
+    if input_root is None:
+        input_root = Path(config.input_dir)
     total = len(files)
     if overall_total is None:
         overall_total = overall_base + total
     chunk_size = max(1, int(config.chunk_size or total))
+    log("Раскладка: output/<relpath_from_input>/<stem>/")
 
     if chunk_size >= total:
         log(f"Один батч: {total} файлов (chunk_size={chunk_size})")
@@ -939,6 +967,7 @@ def _run_staged(
             overall_offset=overall_base, overall_total=overall_total,
             on_overall_progress=on_overall_progress,
             overall_counter=[overall_base],
+            input_root=input_root,
         )
         _free_memory()
         _log_summary(results, log)
@@ -966,6 +995,7 @@ def _run_staged(
                 overall_offset=overall_base + start, overall_total=overall_total,
                 on_overall_progress=on_overall_progress,
                 overall_counter=overall_counter,
+                input_root=input_root,
             )
             all_results.extend(batch_results)
         except Exception as e:  # noqa: BLE001
@@ -989,9 +1019,12 @@ def _run_staged_batch(
     overall_total: Optional[int] = None,
     on_overall_progress: Optional[OverallFn] = None,
     overall_counter: Optional[list[int]] = None,
+    input_root: Optional[Path] = None,
 ) -> list[FileResult]:
     """One chunk of the staged pipeline. All temps are tracked and removed
     in the `finally` block at the end of this call."""
+    if input_root is None:
+        input_root = Path(config.input_dir)
     if overall_total is None:
         overall_total = len(batch_files)
 
@@ -1048,7 +1081,7 @@ def _run_staged_batch(
     resumed_partial = 0
     mismatched_folders = 0
     for f in batch_files:
-        track_out = output_root / f.stem
+        track_out = _output_dir_for(f, input_root, output_root)
         audio_path: Path = f
         skip_convert = False
         skip_separate = False
@@ -1064,7 +1097,7 @@ def _run_staged_batch(
             )
             if has_artifacts:
                 mismatched_folders += 1
-                log(f"  ⚠ {f.name}: папка {track_out.name} относится к другому треку — обрабатываю заново")
+                log(f"  ⚠ коллизия раскладки: {track_out} занят другим треком — обрабатываю заново")
 
         text_file = track_out / "text.txt"
         if config.skip_existing and _is_track_finished(track_out, config, belongs):
@@ -1138,7 +1171,7 @@ def _run_staged_batch(
                             ident.metadata, ident.shazam, ident.source,
                             input_path=f,
                         )
-                        track_out = output_root / f.stem
+                        track_out = _output_dir_for(f, input_root, output_root)
                         track_out.mkdir(parents=True, exist_ok=True)
                         if ident.text:
                             (track_out / "text.txt").write_text(ident.text, encoding="utf-8")
@@ -1173,7 +1206,7 @@ def _run_staged_batch(
                         # convert.enabled=False src == f, so every track would
                         # overwrite input_dir/vocals.wav. Only reuse the track
                         # output folder when the source already lives there.
-                        track_dir = output_root / f.stem
+                        track_dir = _output_dir_for(f, input_root, output_root)
                         if src.parent == track_dir:
                             # Already in the persistent track folder (resume).
                             target = src.parent / "vocals.wav"
@@ -1208,7 +1241,7 @@ def _run_staged_batch(
                 # separate resumed/original files one by one and batch the rest.
                 resumed = [
                     f for f in todo
-                    if state[f]["audio_path"].parent == output_root / f.stem
+                    if state[f]["audio_path"].parent == _output_dir_for(f, input_root, output_root)
                     or state[f]["audio_path"].parent == f.parent
                 ]
                 resumed_set = set(resumed)
@@ -1336,7 +1369,7 @@ def _run_staged_batch(
                     if isinstance(src_audio, Path):
                         vocal = src_audio.parent / "vocals.wav"
                         if vocal.exists():
-                            track_out = output_root / f.stem
+                            track_out = _output_dir_for(f, input_root, output_root)
                             track_out.mkdir(parents=True, exist_ok=True)
                             dst = track_out / "vocals.wav"
                             if dst.exists():
@@ -1377,7 +1410,7 @@ def _run_staged_batch(
             )
             s["metadata_dict"] = metadata_dict
 
-            track_out = output_root / f.stem
+            track_out = _output_dir_for(f, input_root, output_root)
             track_out.mkdir(parents=True, exist_ok=True)
             if _artifact_belongs_to(track_out, f):
                 metadata_dict = _merge_metadata_file(
@@ -1427,7 +1460,7 @@ def _run_staged_batch(
     return [
         FileResult(
             f, state[f]["text"],
-            output_root / f.stem if state[f]["error"] is None else None,
+            _output_dir_for(f, input_root, output_root) if state[f]["error"] is None else None,
             state[f]["error"], state[f]["source"], state[f]["metadata_dict"],
         )
         for f in batch_files
