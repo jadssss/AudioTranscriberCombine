@@ -151,7 +151,7 @@ class MainWindow(QMainWindow):
         resume_opts = QHBoxLayout()
         self.skip_existing_cb = QCheckBox("Пропускать готовые (text.txt)")
         self.skip_existing_cb.setToolTip(
-            "Не трогать файлы, у которых в <output>/<stem>/ уже есть text.txt.\n"
+            "Не трогать файлы, у которых в <output>/<relpath>/<stem>/ уже есть text.txt.\n"
             "Позволяет продолжить большой прогон после сбоя без пересчёта.\n"
             "Если в metadata.json записан path другого файла — папка не считается готовой."
         )
@@ -368,7 +368,7 @@ class MainWindow(QMainWindow):
         self.separate_save_vocals_cb = QCheckBox("Всегда сохранять vocals.wav в output")
         self.separate_save_vocals_cb.setToolTip(
             "Независимо от 'Сохранять промежуточные': вокал всегда будет лежать "
-            "в <output>/<stem>/vocals.wav — полезно для LRC-этапа."
+            "в <output>/<relpath>/<stem>/vocals.wav — полезно для LRC-этапа."
         )
         form.addRow("", self.separate_save_vocals_cb)
         return w
@@ -412,7 +412,7 @@ class MainWindow(QMainWindow):
         form.setSpacing(10)
 
         info = QLabel(
-            "1) Сгенерировать LRC: WhisperX + align → <output>/<stem>/text.lrc.\n"
+            "1) Сгенерировать LRC: WhisperX + align → <output>/<relpath>/<stem>/text.lrc.\n"
             "2) Встроить LRC: записывает LRC в тег lyrics аудио (USLT/LYRICS/©lyr).\n"
             "Если 'in-place' выключено — оригинал не трогается, создаётся копия в output."
         )
@@ -433,7 +433,7 @@ class MainWindow(QMainWindow):
         form.addRow("", self.lrc_embed_enabled_cb)
         self.lrc_skip_existing_cb = QCheckBox("Пропускать готовые text.lrc")
         self.lrc_skip_existing_cb.setToolTip(
-            "Если <output>/<stem>/text.lrc уже существует и содержит корректный LRC,\n"
+            "Если <output>/<relpath>/<stem>/text.lrc уже существует и содержит корректный LRC,\n"
             "файл не будет пересчитан. Папка с metadata.json от другого трека\n"
             "готовой не считается."
         )
@@ -463,7 +463,7 @@ class MainWindow(QMainWindow):
 
         self.lrc_embed_in_place_cb = QCheckBox("Встраивать in-place (перезаписывать оригинал)")
         self.lrc_embed_in_place_cb.setToolTip(
-            "Если выключено (по умолчанию) — создаётся копия в <output>/<stem>/<name>.\n"
+            "Если выключено (по умолчанию) — создаётся копия в <output>/<relpath>/<stem>/<name>.\n"
             "Если включено — оригинальный файл модифицируется."
         )
         form.addRow("", self.lrc_embed_in_place_cb)
