@@ -35,10 +35,100 @@ def _is_dead_cuda(exc: BaseException) -> bool:
     return any(m in err for m in _DEAD_CUDA_MARKERS)
 
 
+    _WhisperXModels._cache.clear()
+    _AlignModels._cache.clear()
+    _GigaAMModels._cache.clear()
+    _StableTSModels._cache.clear()
+    _REUSE_LOGGED.clear()
+
+
+# Phrases that are strong signals of ASR hallucination (end credits)
+_HALLUCINATION_PHRASES = (
+    "продолжение следует",
+    "спасибо за внимание",
+    "спасибо за просмотр",
+    "спасибо за подписку",
+    "подписывайтесь на канал",
+    "ставьте лайки",
+    "не забудьте подписаться",
+    "субтитры создавал",
+    "субтитры сделал",
+    "субтитры подготовил",
+    "редактор субтитров",
+    "корректор",
+    "thank you for watching",
+    "thanks for watching",
+    "please subscribe",
+    "subscribe to my channel",
+    "like and subscribe",
+)
+
+
+def _is_hallucination(text: str) -> bool:
+    """Return True if the text looks like an ASR hallucination.
+
+    Checks:
+      - known call-to-action / promo phrases;
+      - repeated-word tic ("Музыка Музыка").
+    """
+    if not text:
+        return False
+    t = " ".join(text.lower().split()).strip(" .!?…,;:\"'«»")
+    for phrase in _HALLUCINATION_PHRASES:
+        if phrase in t:
+            return True
+    words = t.split()
+    if len(words) == 2 and words[0] == words[1]:
+        return True
+    return False
+
+
+def _detect_language(model_obj, audio_or_path, fallback: str = "ru") -> str:
+    """Detect the spoken language from audio using the ASR model itself.
+
+    Returns a lowercase ISO code or `fallback` on failure.
+    """
+    try:
+        lang, _prob = model_obj.detect_language(audio_or_path)
+        if lang:
+            return lang.lower()
+    except Exception:
+        pass
+    return fallback
+
+
+class _StableTSModels:
+    _cache: dict = {}
+
+    @classmethod
+    def get(cls, model_name: str, device: str, compute_type: Optional[str],
+            local_files_only: bool = False) -> Any:
+        if compute_type is None:
+            compute_type = "int8_float16" if device == "cuda" else "int8"
+        key = (model_name, device, compute_type, local_files_only)
+        with _MODEL_LOCK:
+            if key not in cls._cache:
+                import stable_whisper
+
+                print(f"  [ALIGN] loading stable-ts {model_name} on {device} "
+                      f"({compute_type}, local_files_only={local_files_only})...")
+
+                def load() -> 'faster_whisper.WhisperModel':
+                    return stable_whisper.load_faster_whisper(
+                        model_name, device=device, compute_type=compute_type,
+                        local_files_only=local_files_only,
+                    )
+
+                cls._cache[key] = _retry(load)
+                print("  [ALIGN] stable-ts model loaded once — reuse.")
+            return cls._cache[key]
+
+
 def _clear_model_caches() -> None:
     _WhisperXModels._cache.clear()
     _AlignModels._cache.clear()
     _GigaAMModels._cache.clear()
+    _StableTSModels._cache.clear()
     _REUSE_LOGGED.clear()
 
 
@@ -285,7 +375,21 @@ def _transcribe_whisperx(
     result = _model_transcribe_with_retry(
         model, audio, language, batch_size, name=audio_path.name,
     )
-    text = " ".join(seg["text"].strip() for seg in result["segments"]).strip()
+
+    # Filter out hallucinated / spammy segments.
+    segments = result.get("segments") or []
+    kept = []
+    for seg in segments:
+        t = (seg.get("text") or "").strip()
+        if not t or _is_hallucination(t):
+            continue
+        if seg.get("avg_logprob", 0.0) < -1.2:
+            continue
+        kept.append(seg)
+    text = " ".join(s["text"].strip() for s in kept).strip()
+    if _is_hallucination(text):
+        text = ""
+
     del audio, result
     _free_vram()
     return text
@@ -333,6 +437,47 @@ def transcribe_aligned(
         print(f"  [ALIGN] failed: {e}. Falling back to raw WhisperX segments.")
         segments = result["segments"]
 
+    # Filter out hallucinated segments.
+    segments = [s for s in segments if not _is_hallucination(s.get("text", ""))]
+
     del audio, result
     _free_vram()
     return segments, detected
+
+
+def align_text_to_audio(
+    audio_path: Path,
+    text: str,
+    language: Optional[str] = "ru",
+    model: str = "large-v3",
+    device: str = "auto",
+    compute_type: Optional[str] = None,
+    local_files_only: bool = False,
+) -> tuple[list[dict], str]:
+    """Forced alignment of EXISTING text to audio. No ASR.
+
+    When `language` is None, the language is auto-detected from the audio
+    using the alignment model itself (which is a faster-whisper model and
+    exposes `detect_language`).
+    """
+    import stable_whisper as _sw
+    device = _resolve_device(device)
+    model_obj = _StableTSModels.get(model, device, compute_type, local_files_only)
+
+    if language:
+        lang = language
+    else:
+        lang = _detect_language(model_obj, str(audio_path), fallback="ru")
+
+    try:
+        result = model_obj.align(str(audio_path), text, language=lang)
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(f"align failed on {audio_path.name}: {e}") from e
+
+    segments = [
+        {"start": float(seg.start), "end": float(seg.end),
+         "text": (seg.text or "").strip()}
+        for seg in result.segments
+        if (seg.text or "").strip()
+    ]
+    return segments, lang

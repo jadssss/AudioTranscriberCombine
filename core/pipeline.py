@@ -228,6 +228,16 @@ def _is_track_finished(
     """True when ``skip_existing`` may skip this output folder entirely."""
     if not belongs:
         return False
+    # If metadata says this track had an empty ASR result, treat it as
+    # "finished" so skip_existing does not keep re‑running it.
+    meta = track_out / "metadata.json"
+    if meta.is_file():
+        try:
+            data = json.loads(meta.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and data.get("empty_text"):
+                return True
+        except (OSError, ValueError):
+            pass
     if _final_artifact_present(track_out, config):
         return True
     # Identification-only runs still finish with text.txt (no other stage
@@ -879,6 +889,8 @@ def _run_sequential(
             metadata_dict = _build_metadata_dict(
                 ident.metadata, ident.shazam, source, input_path=f,
             )
+            if metadata_dict.get("empty_text") is None:
+                metadata_dict["empty_text"] = False
             if belongs:
                 metadata_dict = _merge_metadata_file(
                     track_out / "metadata.json", metadata_dict,
@@ -1175,6 +1187,9 @@ def _run_staged_batch(
                         track_out.mkdir(parents=True, exist_ok=True)
                         if ident.text:
                             (track_out / "text.txt").write_text(ident.text, encoding="utf-8")
+                            md = state[f].setdefault("metadata_dict", {})
+                            if md.get("empty_text") is None:
+                                md["empty_text"] = False
                         if state[f]["metadata_dict"]:
                             _write_metadata_json(track_out / "metadata.json", state[f]["metadata_dict"])
                         _save_unrecognized(
@@ -1434,6 +1449,9 @@ def _run_staged_batch(
             else:
                 if text:
                     (track_out / "text.txt").write_text(text, encoding="utf-8")
+                    md = metadata_dict.setdefault("empty_text", False)
+                else:
+                    md = metadata_dict.setdefault("empty_text", True)
                 if metadata_dict:
                     _write_metadata_json(track_out / "metadata.json", metadata_dict)
 

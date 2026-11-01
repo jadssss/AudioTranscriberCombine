@@ -70,6 +70,35 @@ def is_lrc(content: str) -> bool:
 
 # ---------------------------------------------------------------- read embedded
 
+_JUNK_LYRIC_MARKERS = (
+    "created with",
+    "russian-area.de",
+    "http://", "https://",
+    "www.",
+    "mp3tag",
+    "tag&rename",
+    "foobar2000",
+    "itunes",
+)
+
+
+def _is_junk_lyrics(text: str) -> bool:
+    """Reject tag values that are really URL/signature junk, not lyrics."""
+    if not text or len(text.strip()) < 3:
+        return True
+    low = text.lower()
+    if any(m in low for m in _JUNK_LYRIC_MARKERS):
+        return True
+    # A "lyrics" blob that is just an email or URL — reject.
+    import re
+    stripped = re.sub(r"\s+", "", low)
+    if re.fullmatch(r"[a-z0-9.\-_/]+", stripped) and (
+        "." in stripped or "/" in stripped
+    ):
+        return True
+    return False
+
+
 def read_embedded_lyrics(audio_path: Path) -> Optional[str]:
     """Return lyrics stored in the file's tags, or None.
 
@@ -78,14 +107,18 @@ def read_embedded_lyrics(audio_path: Path) -> Optional[str]:
     suffix = audio_path.suffix.lower()
     try:
         if suffix in (".mp3", ".mp2"):
-            return _read_mp3(audio_path)
-        if suffix in (".flac", ".ogg", ".opus"):
-            return _read_vorbis(audio_path)
-        if suffix in (".m4a", ".mp4", ".m4b", ".aac"):
-            return _read_mp4(audio_path)
-    except Exception:  # noqa: BLE001 — never break the pipeline on tag issues
+            text = _read_mp3(audio_path)
+        elif suffix in (".flac", ".ogg", ".opus"):
+            text = _read_vorbis(audio_path)
+        elif suffix in (".m4a", ".mp4", ".m4b", ".aac"):
+            text = _read_mp4(audio_path)
+        else:
+            return None
+    except Exception:  # noqa: BLE001
         return None
-    return None
+    if text and _is_junk_lyrics(text):
+        return None
+    return text
 
 
 def _read_mp3(path: Path) -> Optional[str]:

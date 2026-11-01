@@ -728,6 +728,12 @@ class MainWindow(QMainWindow):
                 "Этап генерации LRC выключен. Включите его на вкладке LRC."
             )
             return
+        if task == "lrc" and not cfg.transcribe.enabled:
+            QMessageBox.information(
+                self, "Транскрибация выключена",
+                "Транскрибация отключена, ASR запускаться не будет."
+                "LRC будет построен только по готовым text.txt."
+            )
         if task == "embed" and not cfg.lrc.embed_enabled:
             QMessageBox.warning(
                 self, "Встраивание LRC отключено",
